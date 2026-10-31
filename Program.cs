@@ -3,10 +3,12 @@ using System.Text.RegularExpressions;
 
 // Joins src\*.lua (in the order listed in src\_order.txt) into dist\obs_to_nvidia.lua.
 // Usage: obs_to_nvidia [projectRoot] [--copy-to <folder>] [--no-check]
-//                      [--publish [--yes] [--no-bump]]
+//                      [--publish [--yes] [--no-bump] [--version X.Y]]
 //   --publish  : auto-bump VERSION, build, commit + push, create the GitHub Release.
 //                (no console window; output goes to publish.log and the VS Output window)
 //   --no-bump  : publish with the VERSION already in the file (don't increase it).
+//   --version X: publish exactly X (also writes it into the source).
+//   The version is decided ONLY from local files (src + .publish-state), never from GitHub.
 
 bool isPublish = args.Contains("--publish");
 int code;
@@ -26,6 +28,7 @@ static int Go(string[] args)
     string? rootArg = null;
     string? copyTo = null;
     bool check = true, publish = false, yes = false, bump = true;
+    string? forceVersion = null;
     for (int i = 0; i < args.Length; i++)
     {
         if (args[i] == "--copy-to" && i + 1 < args.Length) copyTo = args[++i];
@@ -33,6 +36,7 @@ static int Go(string[] args)
         else if (args[i] == "--publish") publish = true;
         else if (args[i] == "--yes") yes = true;
         else if (args[i] == "--no-bump") bump = false;
+        else if (args[i] == "--version" && i + 1 < args.Length) forceVersion = args[++i].TrimStart('v');
         else if (rootArg is null) rootArg = args[i];
     }
 
@@ -62,7 +66,7 @@ static int Go(string[] args)
         Console.WriteLine($"Copied to {dest}");
     }
 
-    if (publish) return Publish(root, check, yes, bump);
+    if (publish) return Publish(root, check, yes, bump, forceVersion);
     return 0;
 }
 
@@ -133,10 +137,49 @@ static string? NextVersion(string v)
     return string.Join('.', p);
 }
 
+// Local publish state (.publish-state, git-ignored): "published=<last fully published>" and "pending=<unfinished>".
+static Dictionary<string, string> ReadState(string root)
+{
+    var d = new Dictionary<string, string>();
+    try
+    {
+        foreach (var l in File.ReadAllLines(Path.Combine(root, ".publish-state")))
+        {
+            int i = l.IndexOf('=');
+            if (i > 0) d[l[..i].Trim()] = l[(i + 1)..].Trim();
+        }
+    }
+    catch { }
+    return d;
+}
+static void WriteState(string root, string key, string value)
+{
+    var d = ReadState(root);
+    d[key] = value;
+    File.WriteAllLines(Path.Combine(root, ".publish-state"), d.Select(kv => $"{kv.Key}={kv.Value}"));
+}
+static void ClearPending(string root)
+{
+    var d = ReadState(root);
+    if (d.Remove("pending")) File.WriteAllLines(Path.Combine(root, ".publish-state"), d.Select(kv => $"{kv.Key}={kv.Value}"));
+}
+// Numeric compare, part by part (2.10 > 2.9).
+static int CompareVer(string a, string b)
+{
+    var pa = a.Split('.').Select(x => int.TryParse(x, out var v) ? v : 0).ToArray();
+    var pb = b.Split('.').Select(x => int.TryParse(x, out var v) ? v : 0).ToArray();
+    for (int i = 0; i < Math.Max(pa.Length, pb.Length); i++)
+    {
+        int x = i < pa.Length ? pa[i] : 0, y = i < pb.Length ? pb[i] : 0;
+        if (x != y) return x > y ? 1 : -1;
+    }
+    return 0;
+}
+
 // One-click release: bump VERSION, build, commit + push the sources, then create a GitHub Release
 // with dist\obs_to_nvidia.lua attached (this is what the in-OBS Update Checker downloads).
 // Needs: git (repo with an "origin" on GitHub) and GitHub CLI (gh, logged in).
-static int Publish(string root, bool check, bool yes, bool bump)
+static int Publish(string root, bool check, bool yes, bool bump, string? forceVersion)
 {
     Console.WriteLine();
     Console.WriteLine("=== Publish ===");
@@ -159,29 +202,41 @@ static int Publish(string root, bool check, bool yes, bool bump)
 
     string originalText = File.ReadAllText(verFile, Encoding.UTF8);
     string current = Regex.Match(originalText, Consts.VersionPattern).Groups[2].Value;
-    string next = current;
-    if (bump)
+    // The version is decided from LOCAL files only (VERSION in src + .publish-state), never from GitHub:
+    //   - --version X          -> exactly X
+    //   - unfinished run       -> finish that same version (state has "pending=<current VERSION>")
+    //   - VERSION edited by hand to something other than the last published one -> publish it as is
+    //   - otherwise            -> last number + 1 (unless --no-bump)
+    var state = ReadState(root);
+    state.TryGetValue("published", out string? published);
+    state.TryGetValue("pending", out string? pending);
+    string next;
+    if (forceVersion is not null)
     {
-        string? n = NextVersion(current);
-        if (n is null) { Console.Error.WriteLine($"ERROR: VERSION \"{current}\" is not numeric (like 2.5 or 2.5.1), cannot auto-bump. Use --no-bump."); return 1; }
-        next = n;
+        next = forceVersion;
     }
-    // Self-healing: if the current VERSION was already committed/pushed but its GitHub release
-    // was never created (an earlier run failed at the release step), release THAT version
-    // instead of bumping again.
-    if (bump && Run("gh", $"release view v{current}{repoArg}", root, quiet: true) != 0)
+    else if (pending is not null && pending == current)
     {
-        Console.WriteLine($"v{current} has no GitHub release yet - publishing it without bumping.");
-        bump = false;
+        Console.WriteLine($"v{current} was started earlier but not finished - finishing it (no new bump).");
         next = current;
     }
-    string tag = "v" + next;
-
-    if (Run("gh", $"release view {tag}{repoArg}", root, quiet: true) == 0)
+    else if (published is not null && current != published)
     {
-        Console.Error.WriteLine($"ERROR: release {tag} already exists on GitHub. Set VERSION in {Path.GetFileName(verFile)} to the latest published version and run again.");
-        return 1;
+        if (CompareVer(current, published) < 0)
+        { Console.Error.WriteLine($"ERROR: VERSION {current} is lower than the last published version {published}. Fix VERSION in src, or use --version."); return 1; }
+        Console.WriteLine($"VERSION {current} was set by hand (last published: {published}) - publishing it as is.");
+        next = current;
     }
+    else if (bump)
+    {
+        string? n = NextVersion(current);
+        if (n is null) { Console.Error.WriteLine($"ERROR: VERSION \"{current}\" is not numeric (like 2.5 or 2.5.1), cannot auto-bump. Use --version or --no-bump."); return 1; }
+        next = n;
+    }
+    else next = current;
+    if (!Regex.IsMatch(next, @"^\d+(\.\d+)*$")) { Console.Error.WriteLine($"ERROR: \"{next}\" is not a numeric version (like 2.11 or 3.0.1)."); return 1; }
+    bump = next != current; // true only if the source has to be changed
+    string tag = "v" + next;
 
     if (!yes)
     {
@@ -192,13 +247,15 @@ static int Publish(string root, bool check, bool yes, bool bump)
         if (!string.Equals(a?.Trim(), "y", StringComparison.OrdinalIgnoreCase)) { Console.WriteLine("Cancelled."); return 2; }
     }
 
-    // From here on VERSION may change on disk; any failure puts the original text back.
-    bool pushed = false;
+    // From here on VERSION may change on disk. Until something is committed, any failure puts the
+    // original text back; once committed/pushed the version is kept and the next run finishes it.
+    bool keep = false;
     int Fail(string msg)
     {
         Console.Error.WriteLine("ERROR: " + msg);
-        if (pushed) return 1; // the pushed commit already holds the new VERSION - keep it; the next run finishes the release
+        if (keep) return 1;
         File.WriteAllText(verFile, originalText, new UTF8Encoding(false));
+        ClearPending(root);
         if (bump) Console.Error.WriteLine($"VERSION restored to {current}.");
         return 1;
     }
@@ -209,6 +266,7 @@ static int Publish(string root, bool check, bool yes, bool bump)
         File.WriteAllText(verFile, bumped, new UTF8Encoding(false));
         Console.WriteLine($"VERSION: {current} -> {next}");
     }
+    WriteState(root, "pending", next);
 
     if (BuildBundle(root, out string outPath, out string built) != 0) return Fail("build failed.");
     if (built != next) return Fail($"built VERSION \"{built}\" does not match {next}.");
@@ -216,18 +274,21 @@ static int Publish(string root, bool check, bool yes, bool bump)
 
     EnsureIgnored(root, "publish.log");
     EnsureIgnored(root, "*.zip");
+    EnsureIgnored(root, ".publish-state");
     if (Run("git", "add -A", root) != 0) return Fail("git add failed.");
     if (Run("git", "diff --cached --quiet", root, quiet: true) != 0) // there is something to commit
     {
         if (Run("git", $"commit -m \"Release {tag}\"", root) != 0) return Fail("git commit failed.");
     }
     else Console.WriteLine("Nothing new to commit.");
+    keep = true; // the version is now in a commit: from here a retry continues, never re-bumps
     if (Run("git", "push -u origin HEAD", root) != 0) return Fail("git push failed.");
-    pushed = true;
 
     if (Run("gh", $"release create {tag} \"{outPath}\" --title \"{tag}\" --generate-notes --prerelease{repoArg}", root) != 0)
         return Fail("creating the GitHub release failed (the code is already pushed - just press Release again, it will finish this version).");
 
+    WriteState(root, "published", next);
+    ClearPending(root);
     Console.WriteLine($"DONE - {tag} is published as a PRE-RELEASE.");
     return 0;
 }
