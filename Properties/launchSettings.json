@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "Publish Release": {
+      "commandName": "Project",
+      "commandLineArgs": "--publish --yes"
+    }
+  }
+}

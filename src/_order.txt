@@ -1,0 +1,14 @@
+# Build order. Parts are joined top to bottom into ONE Lua chunk,
+# so they share locals exactly like the original single file.
+00_core.lua
+10_restarter.lua
+20_alert_sounds_data.lua
+21_alert_sound.lua
+30_organizer_win32.lua
+31_organizer_tracking.lua
+32_organizer_steam_names.lua
+33_organizer_files.lua
+40_updater_core.lua
+41_updater_install.lua
+42_updater_check.lua
+90_main.lua

@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>ObsToNvidia</RootNamespace>
+    <AssemblyName>obs_to_nvidia</AssemblyName>
+  </PropertyGroup>
+
+  <!-- src\*.lua show up in Solution Explorer automatically (as "None" items). -->
+
+  <!-- Every normal Build (Ctrl+Shift+B) also produces dist\obs_to_nvidia.lua -->
+  <Target Name="BuildLua" AfterTargets="Build">
+    <PropertyGroup>
+      <DotnetExe Condition="'$(DOTNET_HOST_PATH)' != ''">$(DOTNET_HOST_PATH)</DotnetExe>
+      <DotnetExe Condition="'$(DotnetExe)' == ''">dotnet</DotnetExe>
+    </PropertyGroup>
+    <Exec Command="&quot;$(DotnetExe)&quot; &quot;$(TargetPath)&quot; &quot;$(MSBuildProjectDirectory)&quot;" />
+  </Target>
+
+</Project>
