@@ -225,10 +225,10 @@ static int Publish(string root, bool check, bool yes, bool bump)
     if (Run("git", "push -u origin HEAD", root) != 0) return Fail("git push failed.");
     pushed = true;
 
-    if (Run("gh", $"release create {tag} \"{outPath}\" --title \"{tag}\" --generate-notes{repoArg}", root) != 0)
+    if (Run("gh", $"release create {tag} \"{outPath}\" --title \"{tag}\" --generate-notes --prerelease{repoArg}", root) != 0)
         return Fail("creating the GitHub release failed (the code is already pushed - just press Release again, it will finish this version).");
 
-    Console.WriteLine($"DONE - {tag} is published. OBS users will be offered the update.");
+    Console.WriteLine($"DONE - {tag} is published as a PRE-RELEASE.");
     return 0;
 }
 
