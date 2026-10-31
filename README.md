@@ -89,7 +89,3 @@ Off by default. Turn it on with the group's checkbox, then choose:
 ## Troubleshooting
 
 - **"No properties available" / `Error opening file: (null)` in the Script Log** – OBS couldn't read the script file. Check that `obs_to_nvidia.lua` exists at the path shown in Tools > Scripts, remove the entry, and add the file again.
-
-1. أنشئ Release بتاغ مثل `v2.4.3`.
-2. أرفق `obs_to_nvidia.lua` بنفس الاسم دائماً.
-3. اضغط **Publish release**. الـ workflow يكتب رقم النسخة من التاغ داخل الملف ويرفعه من جديد.
