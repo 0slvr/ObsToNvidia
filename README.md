@@ -85,14 +85,4 @@ Off by default. Turn it on with the group's checkbox, then choose:
 ## Troubleshooting
 
 - **"No properties available" / `Error opening file: (null)` in the Script Log** – OBS couldn't read the script file. Check that `obs_to_nvidia.lua` exists at the path shown in Tools > Scripts, remove the entry, and add the file again.
-- **Two OBS windows after an update** – close the older one (confirm the "Active Outputs" prompt). If you updated from a version older than 2.4.2, install the newest file manually once; later updates then use the safe method.
 - **Replay Buffer didn't restart** – look for `OBS Clip Suite:` lines in the Script Log; start the buffer manually if needed.
-- **Update says "Up to date"** – the Release's version number must be **higher** than the one in your script (`local VERSION = "…"`).
-
-## For maintainers: publishing a new version
-
-1. Create a new GitHub Release with a tag like `v2.4.3`.
-2. Attach `obs_to_nvidia.lua` as an asset (the exact same file name every time).
-3. Click **Publish release**.
-
-The workflow in `.github/workflows/release.yml` downloads the attached file, writes the version from the tag into `local VERSION = "…"` (`v2.4.3` becomes `2.4.3`), and uploads it back to the Release. The in-script updater downloads `releases/latest/download/obs_to_nvidia.lua`, so the tag must be higher than the previous one.
