@@ -148,6 +148,9 @@ static int Publish(string root, bool check, bool yes, bool bump)
     if (Run("gh", "auth status", root, quiet: true) != 0)
     { Console.Error.WriteLine("ERROR: gh is not logged in. Run once in a terminal:  gh auth login"); return 1; }
 
+    // Tell gh the repo explicitly, so it never needs to run git itself.
+    string repoArg = RepoSlug(root) is string slug ? $" --repo {slug}" : "";
+
     // Find the file that holds VERSION and work out the version to release.
     string srcDir = Path.Combine(root, "src");
     string? verFile = ReadParts(root).Select(n => Path.Combine(srcDir, n))
@@ -163,9 +166,18 @@ static int Publish(string root, bool check, bool yes, bool bump)
         if (n is null) { Console.Error.WriteLine($"ERROR: VERSION \"{current}\" is not numeric (like 2.5 or 2.5.1), cannot auto-bump. Use --no-bump."); return 1; }
         next = n;
     }
+    // Self-healing: if the current VERSION was already committed/pushed but its GitHub release
+    // was never created (an earlier run failed at the release step), release THAT version
+    // instead of bumping again.
+    if (bump && Run("gh", $"release view v{current}{repoArg}", root, quiet: true) != 0)
+    {
+        Console.WriteLine($"v{current} has no GitHub release yet - publishing it without bumping.");
+        bump = false;
+        next = current;
+    }
     string tag = "v" + next;
 
-    if (Run("gh", $"release view {tag}", root, quiet: true) == 0)
+    if (Run("gh", $"release view {tag}{repoArg}", root, quiet: true) == 0)
     {
         Console.Error.WriteLine($"ERROR: release {tag} already exists on GitHub. Set VERSION in {Path.GetFileName(verFile)} to the latest published version and run again.");
         return 1;
@@ -181,9 +193,11 @@ static int Publish(string root, bool check, bool yes, bool bump)
     }
 
     // From here on VERSION may change on disk; any failure puts the original text back.
+    bool pushed = false;
     int Fail(string msg)
     {
         Console.Error.WriteLine("ERROR: " + msg);
+        if (pushed) return 1; // the pushed commit already holds the new VERSION - keep it; the next run finishes the release
         File.WriteAllText(verFile, originalText, new UTF8Encoding(false));
         if (bump) Console.Error.WriteLine($"VERSION restored to {current}.");
         return 1;
@@ -201,16 +215,18 @@ static int Publish(string root, bool check, bool yes, bool bump)
     if (check && SyntaxCheck(outPath) != 0) return Fail("syntax check failed.");
 
     EnsureIgnored(root, "publish.log");
+    EnsureIgnored(root, "*.zip");
     if (Run("git", "add -A", root) != 0) return Fail("git add failed.");
     if (Run("git", "diff --cached --quiet", root, quiet: true) != 0) // there is something to commit
     {
         if (Run("git", $"commit -m \"Release {tag}\"", root) != 0) return Fail("git commit failed.");
     }
     else Console.WriteLine("Nothing new to commit.");
-    if (Run("git", "push", root) != 0) return Fail("git push failed.");
+    if (Run("git", "push -u origin HEAD", root) != 0) return Fail("git push failed.");
+    pushed = true;
 
-    if (Run("gh", $"release create {tag} \"{outPath}\" --title \"{tag}\" --generate-notes", root) != 0)
-        return Fail("creating the GitHub release failed (the code is already pushed - run again to retry).");
+    if (Run("gh", $"release create {tag} \"{outPath}\" --title \"{tag}\" --generate-notes{repoArg}", root) != 0)
+        return Fail("creating the GitHub release failed (the code is already pushed - just press Release again, it will finish this version).");
 
     Console.WriteLine($"DONE - {tag} is published. OBS users will be offered the update.");
     return 0;
@@ -231,6 +247,16 @@ static int Run(string exe, string args, string workDir, bool quiet = false)
             RedirectStandardError = true,
             CreateNoWindow = true,
         };
+        // gh itself launches git, so git's and gh's folders must be on the PATH it inherits
+        // (Visual Studio's PATH can be stale and miss them).
+        var extra = new List<string>();
+        foreach (var tool in new[] { "git", "gh" })
+        {
+            string r = ResolveExe(tool);
+            string? d = Path.IsPathRooted(r) ? Path.GetDirectoryName(r) : null;
+            if (d is not null) extra.Add(d);
+        }
+        psi.Environment["PATH"] = string.Join(';', extra) + ";" + (Environment.GetEnvironmentVariable("PATH") ?? "");
         psi.Environment["GIT_TERMINAL_PROMPT"] = "0"; // fail instead of waiting for typing
         psi.Environment["GH_PROMPT_DISABLED"] = "1";
         using var proc = System.Diagnostics.Process.Start(psi)!;
@@ -249,6 +275,18 @@ static int Run(string exe, string args, string workDir, bool quiet = false)
     {
         return -1;
     }
+}
+
+// "owner/name" from the origin URL in .git/config, or null.
+static string? RepoSlug(string root)
+{
+    try
+    {
+        string cfg = File.ReadAllText(Path.Combine(root, ".git", "config"));
+        var m = Regex.Match(cfg, @"\[remote ""origin""\][^\[]*?url\s*=\s*\S*github\.com[:/]([^/\s]+)/([^\s]+?)(\.git)?\s*(\n|$)");
+        return m.Success ? m.Groups[1].Value + "/" + m.Groups[2].Value : null;
+    }
+    catch { return null; }
 }
 
 // Makes sure the log file never gets committed by "git add -A".
@@ -280,6 +318,10 @@ static string ResolveExe(string exe)
     }
     foreach (var c in candidates)
         if (File.Exists(c)) return c;
+    foreach (var dir in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(';', StringSplitOptions.RemoveEmptyEntries))
+    {
+        try { string f = Path.Combine(dir.Trim('"'), exe + ".exe"); if (File.Exists(f)) return f; } catch { }
+    }
     return exe;
 }
 
