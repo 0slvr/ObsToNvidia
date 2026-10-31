@@ -9,6 +9,8 @@ One OBS Studio Lua script that makes **Replay Buffer clipping** painless on Wind
 
 Everything lives in a single file: `obs_to_nvidia.lua`.
 
+[العربية ↓](#العربية)
+
 ---
 
 ## Requirements
@@ -23,7 +25,11 @@ Everything lives in a single file: `obs_to_nvidia.lua`.
 2. Put it somewhere permanent (OBS remembers the path; don't leave it in Downloads).
 3. In OBS: **Tools > Scripts > `+`** and pick the file.
 
+![OBS Tools menu with the Scripts entry highlighted](images/tools-scripts-menu.png)
+
 That's it. Each module has its own group in the Scripts window with an on/off checkbox in the group header.
+
+![The Scripts window showing the four groups: Replay Buffer Restarter, Replay Organizer, Clip Alert Sound, Update Checker](images/scripts-window.png)
 
 ## What each module does
 
@@ -85,4 +91,66 @@ Off by default. Turn it on with the group's checkbox, then choose:
 ## Troubleshooting
 
 - **"No properties available" / `Error opening file: (null)` in the Script Log** – OBS couldn't read the script file. Check that `obs_to_nvidia.lua` exists at the path shown in Tools > Scripts, remove the entry, and add the file again.
+- **Two OBS windows after an update** – close the older one (confirm the "Active Outputs" prompt). If you updated from a version older than 2.4.2, install the newest file manually once; later updates then use the safe method.
 - **Replay Buffer didn't restart** – look for `OBS Clip Suite:` lines in the Script Log; start the buffer manually if needed.
+- **Update says "Up to date"** – the Release's version number must be **higher** than the one in your script (`local VERSION = "…"`).
+
+## For maintainers: publishing a new version
+
+1. Create a new GitHub Release with a tag like `v2.4.3`.
+2. Attach `obs_to_nvidia.lua` as an asset (the exact same file name every time).
+3. Click **Publish release**.
+
+The workflow in `.github/workflows/release.yml` downloads the attached file, writes the version from the tag into `local VERSION = "…"` (`v2.4.3` becomes `2.4.3`), and uploads it back to the Release. The in-script updater downloads `releases/latest/download/obs_to_nvidia.lua`, so the tag must be higher than the previous one.
+
+---
+
+## العربية
+
+**OBS Clip Suite** سكربت Lua واحد لبرنامج OBS على ويندوز، يخلّي قصّ المقاطع بالـ Replay Buffer أسهل. كل شي بملف واحد: `obs_to_nvidia.lua`.
+
+### شنو يسوي
+
+1. **إعادة تشغيل الـ Replay Buffer** – بعد كل حفظ يوقف الـ buffer ويشغّله من جديد، حتى المقاطع المتتالية ما تتداخل ببعض.
+2. **منظّم المقاطع** – يرتّب كل مقطع بمجلد باسم اللعبة أو التطبيق تلقائياً. يعتمد على النافذة الأمامية الحقيقية بدون ما يفتح `cmd` أو PowerShell، فالألعاب بوضع ملء الشاشة ما تنسحب لسطح المكتب. التطبيقات اللي مو ألعاب تروح لمجلد **Desktop** مشترك.
+3. **صوت تنبيه** – صوت قصير كل ما ينحفظ مقطع. مطفي افتراضياً، وفيه 6 أصوات جاهزة أو ملفك الخاص مع التحكم بمستوى الصوت وزر تجربة.
+4. **فاحص التحديثات** – يفحص الـ Releases بـ GitHub ويحدّث السكربت لك.
+
+### المتطلبات
+
+- ويندوز، وOBS Studio بدعم Lua.
+- الـ Replay Buffer مفعّل من `Settings > Output > Replay Buffer` ومعه مفتاح حفظ.
+
+### التثبيت
+
+1. نزّل `obs_to_nvidia.lua` من [آخر Release](../../releases/latest).
+2. حطه بمكان ثابت (مو بمجلد التنزيلات).
+3. من OBS: **Tools > Scripts > `+`** واختر الملف (الصور أعلاه توضح مكان القائمة ونافذة السكربت).
+
+كل ميزة لها مجموعة خاصة بنافذة Scripts مع مربع تشغيل/إطفاء.
+
+### المنظّم
+
+- لتغيير اسم مجلد: اكتب الاسم الحالي، ثم الاسم الجديد، واضغط **Add**.
+- قائمة الألعاب المدمجة تندمج مع ملف `known_games.txt` الخاص بك داخل `%APPDATA%\obs-studio\script-data\OBS-Clip-Suite`. أعد تحميل السكربت بعد التعديل.
+- خيار البحث بـ Steam اختياري، ويُستخدم كآخر حل للألعاب المجهولة.
+
+### التحديثات
+
+- تفحص بعد 10 ثواني تقريباً من فتح OBS، أو يدوياً بزر **Check for Updates Now**.
+- تُعرض فقط نسخة رقمها **أعلى** من نسختك.
+- الأوضاع: اسألني أولاً (الافتراضي)، أو تثبيت تلقائي، أو إشعار بالسجل فقط.
+- نسخة احتياطية تنحفظ بجنب الملف (`.bak` و`.bak-<version>`)، وزر **Restore previous version** يرجّعها.
+- من النسخة 2.4.2: التحديث يُكتب أولاً كملف `.staged`، ثم يفتح OBS جديد وتنسدّ القديمة، والجديدة هي اللي تبدّل الملف وتشغّل الـ buffer مرة وحدة.
+
+### مشاكل شائعة
+
+- **"No properties available" أو `Error opening file: (null)`**: OBS ما قدر يقرأ الملف. احذف السكربت من القائمة وأضفه من جديد.
+- **نافذتين OBS بعد تحديث**: سكّر القديمة. إذا كنت على نسخة أقدم من 2.4.2 ثبّت الملف الجديد يدوياً مرة وحدة.
+- **التحديث يقول "Up to date"**: رقم الـ Release لازم يكون أعلى من `local VERSION` الموجود بملفك.
+
+### نشر نسخة جديدة (للمطوّر)
+
+1. أنشئ Release بتاغ مثل `v2.4.3`.
+2. أرفق `obs_to_nvidia.lua` بنفس الاسم دائماً.
+3. اضغط **Publish release**. الـ workflow يكتب رقم النسخة من التاغ داخل الملف ويرفعه من جديد.
