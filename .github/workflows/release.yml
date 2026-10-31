@@ -1,0 +1,30 @@
+name: Attach script to release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  attach:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Stamp version from the tag
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          VERSION="${TAG#v}"
+          sed -i "s/^local VERSION = \".*\"/local VERSION = \"$VERSION\"/" obs_to_nvidia.lua
+          grep -n '^local VERSION' obs_to_nvidia.lua
+
+      - name: Upload as release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG" obs_to_nvidia.lua --clobber
