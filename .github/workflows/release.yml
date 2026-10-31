@@ -15,16 +15,29 @@ jobs:
         with:
           ref: ${{ github.event.release.tag_name }}
 
+      - name: Locate script
+        id: find
+        run: |
+          FILE=$(find . -type f -iname 'obs_to_nvidia.lua' -not -path './.git/*' | head -n 1)
+          if [ -z "$FILE" ]; then
+            echo "obs_to_nvidia.lua not found at this tag. Repo contents:"
+            git ls-files
+            exit 1
+          fi
+          echo "path=$FILE" >> "$GITHUB_OUTPUT"
+
       - name: Stamp version from the tag
         env:
           TAG: ${{ github.event.release.tag_name }}
+          FILE: ${{ steps.find.outputs.path }}
         run: |
           VERSION="${TAG#v}"
-          sed -i "s/^local VERSION = \".*\"/local VERSION = \"$VERSION\"/" obs_to_nvidia.lua
-          grep -n '^local VERSION' obs_to_nvidia.lua
+          sed -i "s/^local VERSION = \".*\"/local VERSION = \"$VERSION\"/" "$FILE"
+          grep -n '^local VERSION' "$FILE"
 
       - name: Upload as release asset
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name }}
-        run: gh release upload "$TAG" obs_to_nvidia.lua --clobber
+          FILE: ${{ steps.find.outputs.path }}
+        run: gh release upload "$TAG" "$FILE" --clobber
