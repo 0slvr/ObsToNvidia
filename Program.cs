@@ -257,6 +257,10 @@ static int Run(string exe, string args, string workDir, bool quiet = false)
             if (d is not null) extra.Add(d);
         }
         psi.Environment["PATH"] = string.Join(';', extra) + ";" + (Environment.GetEnvironmentVariable("PATH") ?? "");
+        // A stale/limited token in these variables overrides the login made with "gh auth login"
+        // (and causes HTTP 403 on releases). Ignore them; gh then uses its stored login.
+        psi.Environment.Remove("GH_TOKEN");
+        psi.Environment.Remove("GITHUB_TOKEN");
         psi.Environment["GIT_TERMINAL_PROMPT"] = "0"; // fail instead of waiting for typing
         psi.Environment["GH_PROMPT_DISABLED"] = "1";
         using var proc = System.Diagnostics.Process.Start(psi)!;
