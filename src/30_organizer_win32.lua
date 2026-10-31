@@ -183,6 +183,9 @@ BOOL      WinHttpQueryHeaders(HINTERNET hRequest, DWORD dwInfoLevel, const WCHAR
    the path of the currently-running executable (obs64.exe) -- exactly
    what needs to be started again. */
 DWORD  GetModuleFileNameW(HANDLE hModule, WCHAR* lpFilename, DWORD nSize);
+/* The command line OBS was started with (e.g. --portable, --profile, --collection),
+   so the relaunch after an update starts OBS the same way. */
+const WCHAR* GetCommandLineW(void);
 
 /* ShellExecuteW -- not CreateProcess -- launches the new OBS instance:
    it hands the launch to the shell (as if the user double-clicked

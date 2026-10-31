@@ -7,7 +7,7 @@ GitHub Releases. Each module has its own group and on/off checkbox.
 --]]
 
 -- Bump on every GitHub Release (compared numerically: 1.10.0 > 1.9.0).
-local VERSION = "2.12"
+local VERSION = "2.13"
 
 obs = obslua
 
@@ -2401,6 +2401,9 @@ BOOL      WinHttpQueryHeaders(HINTERNET hRequest, DWORD dwInfoLevel, const WCHAR
    the path of the currently-running executable (obs64.exe) -- exactly
    what needs to be started again. */
 DWORD  GetModuleFileNameW(HANDLE hModule, WCHAR* lpFilename, DWORD nSize);
+/* The command line OBS was started with (e.g. --portable, --profile, --collection),
+   so the relaunch after an update starts OBS the same way. */
+const WCHAR* GetCommandLineW(void);
 
 /* ShellExecuteW -- not CreateProcess -- launches the new OBS instance:
    it hands the launch to the shell (as if the user double-clicked
@@ -4721,7 +4724,50 @@ do
             -- shutting down. The new instance then WAITS for this process
             -- to exit before resuming the Replay Buffer, so the two never
             -- record at the same time.
-            local result = shell32.ShellExecuteW(nil, nil, wbuf, utf8_to_wide("--multi"), nil, SW_SHOWNORMAL)
+            -- Start OBS in ITS OWN folder (a wrong working directory makes OBS fail
+            -- to find its data files and exit, which looks like OBS "crashed" after
+            -- the update) and with the SAME arguments it was started with (without
+            -- them a --portable / --profile / --collection setup comes back as a
+            -- different, empty OBS).
+            local wdir = nil
+            local dir_len = len
+            while dir_len > 0 and wbuf[dir_len - 1] ~= 92 do dir_len = dir_len - 1 end -- 92 = "\\"
+            if dir_len > 1 then
+                wdir = ffi.new("WCHAR[?]", dir_len) -- zero-filled, so NUL-terminated
+                ffi.copy(wdir, wbuf, (dir_len - 1) * ffi.sizeof("WCHAR"))
+            end
+
+            local wargs = utf8_to_wide("--multi")
+            local args_ok, built = pcall(function()
+                local cl = kernel32.GetCommandLineW()
+                if cl == nil then return nil end
+                local n = 0
+                while cl[n] ~= 0 do n = n + 1 end
+                local i = 0
+                if cl[0] == 34 then -- quoted program path
+                    i = 1
+                    while i < n and cl[i] ~= 34 do i = i + 1 end
+                    i = i + 1
+                else
+                    while i < n and cl[i] ~= 32 do i = i + 1 end
+                end
+                while i < n and cl[i] == 32 do i = i + 1 end
+                local rest = n - i
+                local extra = " --multi"
+                local buf = ffi.new("WCHAR[?]", rest + #extra + 1)
+                if rest > 0 then
+                    ffi.copy(buf, cl + i, rest * ffi.sizeof("WCHAR"))
+                end
+                for k = 1, #extra do
+                    buf[rest + k - 1] = extra:byte(k)
+                end
+                return buf
+            end)
+            if args_ok and built ~= nil then
+                wargs = built
+            end
+
+            local result = shell32.ShellExecuteW(nil, nil, wbuf, wargs, wdir, SW_SHOWNORMAL)
             if tonumber(ffi.cast("intptr_t", result)) <= 32 then
                 error("ShellExecuteW couldn't start a new OBS instance")
             end
