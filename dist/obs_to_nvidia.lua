@@ -7,7 +7,7 @@ GitHub Releases. Each module has its own group and on/off checkbox.
 --]]
 
 -- Bump on every GitHub Release (compared numerically: 1.10.0 > 1.9.0).
-local VERSION = "2.21"
+local VERSION = "2.22"
 
 obs = obslua
 
@@ -117,7 +117,7 @@ do
     local TEARDOWN_MS = 30000
     local OUR_STOP_WINDOW_MS = 60000
     local BURST_GAP_MS = 3000      -- two saves closer than this count as a burst
-    local MIN_QUIET_MS = 300
+    local MIN_QUIET_MS = 1500      -- after EVERY save, keep the buffer running this long so quick follow-up presses are not lost
     local MAX_QUIET_MS = 2500
     local MAX_SETTLE_MS = 2000
     local RECOVER_STEPS_MS = { 2000, 4000, 8000, 15000, 30000 }
@@ -317,7 +317,7 @@ do
 
         -- Burst detection: how fast were the last saves pressed?
         local n = #save_times
-        local quiet = 0
+        local quiet = MIN_QUIET_MS
         if n >= 2 then
             local gap = save_times[n] - save_times[n - 1]
             if gap < BURST_GAP_MS then
@@ -2101,7 +2101,7 @@ end
     -- ---------------------------------------------------------------------
     -- Settings (filled in from the Scripts window)
     -- ---------------------------------------------------------------------
-    local alert_sound = true
+    local alert_sound = false
     local selected_sound_id = "new_notification"
     local custom_sound_path = ""  -- if set, overrides the dropdown choice above
     -- 0..100, applied as a linear multiplier (obs_source_set_volume wants
@@ -2347,9 +2347,19 @@ end
 -- Puts the primed source on the output channel = plays it from the start,
 -- and (re)starts the poll that watches it.
 local function attach_alert()
-    -- A sound still playing from a previous save: take it off first so the
-    -- activation (and with it "restart on activate") happens again.
-    detach_alert()
+    -- A sound still on the channel from a previous save (rapid saves):
+    -- do NOT detach + re-attach in the same tick. OBS handles the deactivate
+    -- asynchronously, so "restart on activate" often never fires and the new
+    -- clip gets silence (or only the tail of the old sound). Restart in place.
+    if alert_attached then
+        obs.obs_source_media_restart(alert_source)
+        alert_started_ns = obs.os_gettime_ns()
+        alert_seen_playing = false
+        alert_nudged = false
+        obs.timer_remove(poll_alert)
+        obs.timer_add(poll_alert, ALERT_POLL_MS)
+        return
+    end
     obs.obs_set_output_source(SOUND_CHANNEL, alert_source)
     alert_attached = true
     alert_started_ns = obs.os_gettime_ns()
@@ -2369,6 +2379,10 @@ local function finish_alert()
 end
 
 poll_alert = function()
+    -- Runs from a 30 ms timer: an error here must never repeat 30x a second
+    -- or leave the sound source stuck on the output channel.
+    local ok, err = pcall(function()
+
     if alert_source == nil or not alert_attached then
         obs.timer_remove(poll_alert)
         return
@@ -2385,6 +2399,15 @@ poll_alert = function()
             or state == obs.OBS_MEDIA_STATE_STOPPED then
             return finish_alert()
         end
+    elseif state == obs.OBS_MEDIA_STATE_ENDED
+        and not alert_nudged
+        and (obs.obs_source_media_get_duration(alert_source) or 0) > 0
+        and elapsed_ms >= obs.obs_source_media_get_duration(alert_source) then
+        -- The timer was held up (e.g. the Organizer was busy) so we never saw
+        -- PLAYING, but the whole sound has had time to play and has ended.
+        -- Without this, the code below mistook it for "never started" and
+        -- rebuilt + replayed it = the alert sounded twice.
+        return finish_alert()
     elseif state == obs.OBS_MEDIA_STATE_ERROR or elapsed_ms >= ALERT_REBUILD_MS then
         -- Never became audible: start over with a fresh source.
         alert_rebuilds = alert_rebuilds + 1
@@ -2405,6 +2428,12 @@ poll_alert = function()
     -- still frees the channel after the hold time.
     if elapsed_ms >= sound_channel_hold_ms then
         finish_alert()
+    end
+    end)
+    if not ok then
+        obs.script_log(obs.LOG_ERROR, "Clip Alert: playback check failed: " .. tostring(err))
+        obs.timer_remove(poll_alert)
+        pcall(detach_alert)
     end
 end
 
@@ -2461,6 +2490,7 @@ end
 
 local function confirm_and_play()
     obs.timer_remove(confirm_and_play)
+    local ok, err = pcall(function()
     local status, path = last_saved_status()
     if status == "missing" then
         -- Not on disk (yet): look again a few times before giving up.
@@ -2474,6 +2504,10 @@ local function confirm_and_play()
         return
     end
     do_sound_alert(false)
+    end)
+    if not ok then
+        obs.script_log(obs.LOG_ERROR, "Clip Alert: alert failed: " .. tostring(err))
+    end
 end
 
     local function trigger_alerts()
@@ -5490,7 +5524,10 @@ do
         -- sitting in the Scripts window.
         -- Same for a live stream / recording / virtual camera: "Yes" would cut
         -- them off, so the dialog waits until they are over.
-        if not force and (Sorter.foreground_is_fullscreen() or outputs_are_active()) then
+        -- The dialog is modal on OBS's own thread: with the Replay Buffer running it
+        -- would freeze OBS (and the buffer) until answered, so it waits as well.
+        if not force and (Sorter.foreground_is_fullscreen() or outputs_are_active()
+            or obs.obs_frontend_replay_buffer_active()) then
             return false
         end
 
@@ -5794,8 +5831,24 @@ do
     -- keeps load-time itself instant.
     update_checker = function()
         obs.timer_remove(update_checker)
+        -- The check is a blocking network call and may open a modal dialog, both on
+        -- OBS's own thread: while the Replay Buffer is running that freezes OBS (and
+        -- the buffer with it). So wait until the buffer is off; try again every 30 s
+        -- for ~20 minutes. "Check for Updates Now" in the Scripts window always works.
+        if check_on_load and obs.obs_frontend_replay_buffer_active() then
+            Updater.check_deferrals = (Updater.check_deferrals or 0) + 1
+            if Updater.check_deferrals <= 40 then
+                obs.timer_add(update_checker, 30000)
+            end
+            return
+        end
         if check_on_load then
-            Updater.check_for_updates(false)
+            -- xpcall + traceback: a failure here is logged with the exact line
+            -- instead of OBS's bare "Failed to call timer_cb" message.
+            local ok, err = xpcall(Updater.check_for_updates, debug.traceback, false)
+            if not ok then
+                obs.script_log(obs.LOG_ERROR, "OBS Clip Suite: update check failed: " .. tostring(err))
+            end
         end
     end
 

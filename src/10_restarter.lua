@@ -33,7 +33,7 @@ do
     local TEARDOWN_MS = 30000
     local OUR_STOP_WINDOW_MS = 60000
     local BURST_GAP_MS = 3000      -- two saves closer than this count as a burst
-    local MIN_QUIET_MS = 300
+    local MIN_QUIET_MS = 1500      -- after EVERY save, keep the buffer running this long so quick follow-up presses are not lost
     local MAX_QUIET_MS = 2500
     local MAX_SETTLE_MS = 2000
     local RECOVER_STEPS_MS = { 2000, 4000, 8000, 15000, 30000 }
@@ -233,7 +233,7 @@ do
 
         -- Burst detection: how fast were the last saves pressed?
         local n = #save_times
-        local quiet = 0
+        local quiet = MIN_QUIET_MS
         if n >= 2 then
             local gap = save_times[n] - save_times[n - 1]
             if gap < BURST_GAP_MS then

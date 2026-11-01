@@ -186,8 +186,24 @@
     -- keeps load-time itself instant.
     update_checker = function()
         obs.timer_remove(update_checker)
+        -- The check is a blocking network call and may open a modal dialog, both on
+        -- OBS's own thread: while the Replay Buffer is running that freezes OBS (and
+        -- the buffer with it). So wait until the buffer is off; try again every 30 s
+        -- for ~20 minutes. "Check for Updates Now" in the Scripts window always works.
+        if check_on_load and obs.obs_frontend_replay_buffer_active() then
+            Updater.check_deferrals = (Updater.check_deferrals or 0) + 1
+            if Updater.check_deferrals <= 40 then
+                obs.timer_add(update_checker, 30000)
+            end
+            return
+        end
         if check_on_load then
-            Updater.check_for_updates(false)
+            -- xpcall + traceback: a failure here is logged with the exact line
+            -- instead of OBS's bare "Failed to call timer_cb" message.
+            local ok, err = xpcall(Updater.check_for_updates, debug.traceback, false)
+            if not ok then
+                obs.script_log(obs.LOG_ERROR, "OBS Clip Suite: update check failed: " .. tostring(err))
+            end
         end
     end
 

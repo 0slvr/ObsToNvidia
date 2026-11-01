@@ -394,7 +394,10 @@
         -- sitting in the Scripts window.
         -- Same for a live stream / recording / virtual camera: "Yes" would cut
         -- them off, so the dialog waits until they are over.
-        if not force and (Sorter.foreground_is_fullscreen() or outputs_are_active()) then
+        -- The dialog is modal on OBS's own thread: with the Replay Buffer running it
+        -- would freeze OBS (and the buffer) until answered, so it waits as well.
+        if not force and (Sorter.foreground_is_fullscreen() or outputs_are_active()
+            or obs.obs_frontend_replay_buffer_active()) then
             return false
         end
 
