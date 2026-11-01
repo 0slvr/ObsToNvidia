@@ -55,7 +55,34 @@ end
 -- stutter the first time each built-in sound is used. Verified to give
 -- byte-identical output to the old decoder over randomised round-trips,
 -- including every padding case.
+local function base64_decode_ffi(data)
+    data = data:gsub('[^A-Za-z0-9+/]', '')
+    local n = #data
+    local out = ffi.new("uint8_t[?]", math.floor(n * 3 / 4) + 3)
+    local vals = ffi.new("int8_t[256]", -1)
+    for i = 1, #B64_CHARS do vals[B64_CHARS:byte(i)] = i - 1 end
+    local bytes = ffi.new("uint8_t[?]", n + 1)
+    ffi.copy(bytes, data, n)
+    local o, acc, bits = 0, 0, 0
+    for i = 0, n - 1 do
+        local v = vals[bytes[i]]
+        if v < 0 then break end
+        acc = (acc * 64 + v) % 16777216   -- keep 24 bits at most
+        bits = bits + 6
+        if bits >= 8 then
+            bits = bits - 8
+            out[o] = math.floor(acc / 2 ^ bits) % 256
+            o = o + 1
+        end
+    end
+    return ffi.string(out, o)
+end
+
 local function base64_decode(data)
+    if ffi then
+        local ok, res = pcall(base64_decode_ffi, data)
+        if ok and #res > 0 then return res end
+    end
     data = data:gsub('[^A-Za-z0-9+/]', '')  -- also drops '=' padding
 
     local out, n = {}, 0
@@ -138,12 +165,12 @@ end
 -- second clip was saved while the first alert was still finishing) can
 -- deadlock. The timer runs on OBS's normal script thread instead.
 local alert_source = nil
+local prewarm_sound -- forward-declared (assigned inside the module block below)
 local alert_started_ns = 0
 local alert_seen_playing = false
 local ALERT_POLL_MS = 200
 
 local function clear_sound_channel()
-    obs.timer_remove(clear_sound_channel)
     obs.obs_set_output_source(SOUND_CHANNEL, nil)
     if alert_source ~= nil then
         obs.obs_source_release(alert_source)
@@ -174,7 +201,15 @@ local function poll_alert()
     end
 end
 
-local function do_sound_alert()
+local last_alert_ns = 0
+local ALERT_MIN_GAP_NS = 1.5e9   -- hotkey spam must not create a new audio source per press
+
+local function do_sound_alert(force)
+    local now_ns = obs.os_gettime_ns()
+    if not force and (now_ns - last_alert_ns) < ALERT_MIN_GAP_NS then
+        return
+    end
+    last_alert_ns = now_ns
     local path = custom_sound_path
     if path ~= nil and path ~= "" then
         -- A custom path that no longer exists (file renamed, drive
@@ -257,7 +292,7 @@ end
     -- the situation where you'd most want to audition a sound -- while
     -- setting it up, before switching the feature on.
     local function test_alert_clicked(props, property)
-        do_sound_alert()
+        do_sound_alert(true)
         return false
     end
 
@@ -319,6 +354,15 @@ end
     obs.obs_data_set_default_int(settings, "sound_channel", 63)
 end
 
+    -- Decode the chosen built-in sound shortly after load/changes, so the first
+    -- real alert doesn't stutter while it is being decoded.
+    prewarm_sound = function()
+        obs.timer_remove(prewarm_sound)
+        if alert_sound and (custom_sound_path == nil or custom_sound_path == "") then
+            pcall(builtin_sound_path_for, sound_choice_by_id(selected_sound_id))
+        end
+    end
+
     function Alert.script_update(settings)
     alert_sound = obs.obs_data_get_bool(settings, "alert_sound")
     selected_sound_id = obs.obs_data_get_string(settings, "selected_sound_id")
@@ -347,6 +391,8 @@ end
     if new_channel < 0 or new_channel > 63 then
         new_channel = 63
     end
+    obs.timer_remove(prewarm_sound)
+    obs.timer_add(prewarm_sound, 2000)
     if new_channel ~= SOUND_CHANNEL then
         obs.timer_remove(poll_alert)
         clear_sound_channel()
@@ -356,7 +402,13 @@ end
 
     function Alert.script_unload()
         obs.timer_remove(poll_alert)
+        obs.timer_remove(prewarm_sound)
         clear_sound_channel()
+        -- Remove the decoded temp copies of the built-in sounds.
+        for id, path in pairs(decoded_paths) do
+            W.remove(path)
+            decoded_paths[id] = nil
+        end
     end
 end
 

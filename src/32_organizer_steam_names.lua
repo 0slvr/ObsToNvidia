@@ -174,16 +174,16 @@ end
 -- STEAM_*_TIMEOUT_MS constants above specifically because of that.
 -- Returns the response body as a string, or nil on any failure.
 -- WinHttpQueryHeaders selectors for the status-code read below.
-local WINHTTP_QUERY_STATUS_CODE   = 19
-local WINHTTP_QUERY_CONTENT_LENGTH = 5
-local WINHTTP_QUERY_FLAG_NUMBER   = 0x20000000
+C.WINHTTP_QUERY_STATUS_CODE   = 19
+C.WINHTTP_QUERY_CONTENT_LENGTH = 5
+C.WINHTTP_QUERY_FLAG_NUMBER   = 0x20000000
 
 -- Reads a numeric response header (status code, Content-Length) or nil.
 local function query_number_header(hRequest, selector)
     local value = ffi.new("DWORD[1]")
     local len = ffi.new("DWORD[1]", ffi.sizeof("DWORD"))
     local ok = winhttp.WinHttpQueryHeaders(hRequest,
-        selector + WINHTTP_QUERY_FLAG_NUMBER, nil, value, len, nil)
+        selector + C.WINHTTP_QUERY_FLAG_NUMBER, nil, value, len, nil)
     if ok == 0 then
         return nil
     end
@@ -219,20 +219,20 @@ local function https_get(host, path_and_query, timeouts)
 
     local ok, body = pcall(function()
         hSession = winhttp.WinHttpOpen(utf8_to_wide("OBS-ReplayOrganizer/1.0"),
-            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, nil, nil, 0)
+            C.WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, nil, nil, 0)
         if hSession == nil then return nil end
 
         winhttp.WinHttpSetTimeouts(hSession,
-            timeouts.resolve or STEAM_RESOLVE_TIMEOUT_MS,
-            timeouts.connect or STEAM_CONNECT_TIMEOUT_MS,
-            timeouts.send    or STEAM_SEND_TIMEOUT_MS,
-            timeouts.receive or STEAM_RECEIVE_TIMEOUT_MS)
+            timeouts.resolve or C.STEAM_RESOLVE_TIMEOUT_MS,
+            timeouts.connect or C.STEAM_CONNECT_TIMEOUT_MS,
+            timeouts.send    or C.STEAM_SEND_TIMEOUT_MS,
+            timeouts.receive or C.STEAM_RECEIVE_TIMEOUT_MS)
 
         hConnect = winhttp.WinHttpConnect(hSession, utf8_to_wide(host), 443, 0)
         if hConnect == nil then return nil end
 
         hRequest = winhttp.WinHttpOpenRequest(hConnect, utf8_to_wide("GET"),
-            utf8_to_wide(path_and_query), nil, nil, nil, WINHTTP_FLAG_SECURE)
+            utf8_to_wide(path_and_query), nil, nil, nil, C.WINHTTP_FLAG_SECURE)
         if hRequest == nil then return nil end
 
         local deadline_ns = timeouts.total and (obs.os_gettime_ns() + timeouts.total * 1e6) or nil
@@ -247,10 +247,10 @@ local function https_get(host, path_and_query, timeouts)
         -- response. For the Steam lookup that just meant a garbage game
         -- name; for the updater it meant GitHub's HTML "Not Found" page
         -- could be treated as the script.
-        local status = query_number_header(hRequest, WINHTTP_QUERY_STATUS_CODE)
+        local status = query_number_header(hRequest, C.WINHTTP_QUERY_STATUS_CODE)
         if status ~= nil and status ~= 200 and status ~= 206 then return nil end
 
-        local expected = query_number_header(hRequest, WINHTTP_QUERY_CONTENT_LENGTH)
+        local expected = query_number_header(hRequest, C.WINHTTP_QUERY_CONTENT_LENGTH)
 
         local chunks = {}
         local total = 0
@@ -316,9 +316,8 @@ local function persist_known_game(raw_exe_name, friendly)
         return
     end
 
-    -- friendly_name() calls this every time it resolves a name from a
-    -- window title. Without a duplicate check, a long session could append
-    -- the identical line dozens of times.
+    -- Only Steam lookups call this (never window-title names). The duplicate
+    -- check stops the same line being appended again within one session.
     local line = raw_exe_name .. "=" .. friendly
     if persisted_this_session[line] then
         return
@@ -419,7 +418,8 @@ local NON_GAME_EXES = {
 -- one of these (or in a folder literally named "Games"). Discord, Claude,
 -- browsers, editors... live in AppData / Program Files, so they never match.
 local GAME_LIBRARY_MARKERS = {
-    "\\steamapps\\common\\", "\\epic games\\", "\\gog galaxy\\games\\", "\\gog games\\",
+    "\\steamapps\\common\\", "\\steamlibrary\\", "\\epic games\\", "\\gog galaxy\\games\\", "\\gog games\\",
+    "\\battle.net\\", "\\blizzard entertainment\\", "\\amazon games\\library\\", "\\itch\\apps\\",
     "\\riot games\\", "\\ubisoft\\ubisoft game launcher\\games\\", "\\ea games\\",
     "\\origin games\\", "\\xboxgames\\", "\\rockstar games\\",
     "\\games\\",
@@ -428,6 +428,10 @@ local GAME_LIBRARY_MARKERS = {
 local function is_in_game_library(path)
     if not path or path == "" then return false end
     local p = path:lower():gsub("/", "\\")
+    -- The store launchers themselves also live under "Epic Games" etc.
+    if p:find("\\epic games\\launcher\\", 1, true) or p:find("\\epic online services\\", 1, true) then
+        return false
+    end
     for _, marker in ipairs(GAME_LIBRARY_MARKERS) do
         if p:find(marker, 1, true) then
             return true
@@ -436,7 +440,14 @@ local function is_in_game_library(path)
     return false
 end
 
-local function friendly_name(raw_exe_name, window_title, is_fullscreen)
+-- "...\\steamapps\\common\\Hades II\\Ship\\Hades2.exe" -> "Hades II" (offline, exact).
+local function steam_folder_name(exe_path)
+    if not exe_path then return nil end
+    local name = exe_path:gsub("/", "\\"):match("[Ss][Tt][Ee][Aa][Mm][Aa][Pp][Pp][Ss]\\[Cc][Oo][Mm][Mm][Oo][Nn]\\([^\\]+)\\")
+    return name
+end
+
+local function friendly_name(raw_exe_name, window_title, is_fullscreen, exe_path)
     local lower = raw_exe_name:lower()
 
     local mapped = name_map[lower]
@@ -472,7 +483,7 @@ local function friendly_name(raw_exe_name, window_title, is_fullscreen)
     if has_title then
         -- Sanitize now (not just later in on_replay_saved) so the name we
         -- remember is the EXACT string that will become the folder name.
-        local name = sanitize(extract_stable_app_name(window_title))
+        local name = sanitize(extract_stable_app_name(window_title, is_fullscreen))
         -- Lock this exe -> name for the rest of this OBS session, so a
         -- title that isn't perfectly identical every time (loading screen,
         -- stray invisible character, ...) doesn't fan out into several
@@ -483,6 +494,13 @@ local function friendly_name(raw_exe_name, window_title, is_fullscreen)
             title_name_cache[lower] = name
         end
         return name
+    end
+
+    -- No window title: the Steam install folder names the game exactly, offline.
+    local folder_name = steam_folder_name(exe_path)
+    if folder_name then
+        title_name_cache[lower] = sanitize(folder_name)
+        return title_name_cache[lower]
     end
 
     local steam_name = steam_lookup_name(raw_exe_name)

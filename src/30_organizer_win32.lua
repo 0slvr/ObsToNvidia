@@ -14,7 +14,7 @@ local sorter_available = (ffi ~= nil)
 -- module's do-block is invisible to code in a different module's
 -- do-block -- Lua would silently fall back to an unset *global*
 -- `kernel32`/`user32` there instead, which is what used to break the
--- self-restart after an update (kernel32) and then, after the WM_CLOSE
+-- self-restart after an update (kernel32) and then, after the C.WM_CLOSE
 -- fix, the graceful-close step too (user32 -- EnumWindows/
 -- IsWindowVisible/PostMessageW all live in user32, not kernel32).
 local kernel32, user32, shell32
@@ -202,12 +202,12 @@ HANDLE ShellExecuteW(HWND hwnd, const WCHAR* lpOperation, const WCHAR* lpFile,
    this is the one place in the whole script that reaches past OBS itself
    -- and only after a fresh copy is already starting up.
    This is done by finding this process's own main window and posting it
-   a normal WM_CLOSE, the same message Windows sends when the user clicks
+   a normal C.WM_CLOSE, the same message Windows sends when the user clicks
    the title-bar X -- NOT ExitProcess(), which used to hard-kill the
    process. A hard kill skips OBS's own shutdown path entirely, so it
    never gets to write the "clean exit" marker it checks on the next
    launch -- that's what was popping the "OBS Studio did not properly
-   shut down" / Safe Mode prompt after every self-update. WM_CLOSE lets
+   shut down" / Safe Mode prompt after every self-update. C.WM_CLOSE lets
    OBS run its real shutdown (save config, release the single-instance
    lock, mark the exit clean) before the process actually ends. */
 DWORD  GetCurrentProcessId();
@@ -216,11 +216,11 @@ typedef struct { DWORD dwLowDateTime; DWORD dwHighDateTime; } FILETIME;
 BOOL   GetProcessTimes(HANDLE hProcess, FILETIME* lpCreationTime, FILETIME* lpExitTime,
                        FILETIME* lpKernelTime, FILETIME* lpUserTime);
 BOOL   IsWindowVisible(HWND hWnd);
-typedef int (*WNDENUMPROC)(HWND, long);
-BOOL   EnumWindows(WNDENUMPROC lpEnumFunc, long lParam);
-BOOL   PostMessageW(HWND hWnd, unsigned int Msg, unsigned long wParam, long lParam);
+typedef int (*WNDENUMPROC)(HWND, intptr_t);
+BOOL   EnumWindows(WNDENUMPROC lpEnumFunc, intptr_t lParam);
+BOOL   PostMessageW(HWND hWnd, unsigned int Msg, uintptr_t wParam, intptr_t lParam);
 
-/* GetWindow(hWnd, GW_OWNER) tells an owned window (Scripts dialog, floating
+/* GetWindow(hWnd, C.GW_OWNER) tells an owned window (Scripts dialog, floating
    dock) from the real top-level main window, so relaunch_obs() closes OBS's
    main window and never one of those. */
 HWND   GetWindow(HWND hWnd, unsigned int uCmd);
@@ -243,33 +243,33 @@ if sorter_available then
     end
 end
 
--- PROCESS_QUERY_LIMITED_INFORMATION: unlike PROCESS_QUERY_INFORMATION,
+-- C.PROCESS_QUERY_LIMITED_INFORMATION: unlike PROCESS_QUERY_INFORMATION,
 -- this is specifically designed to let a normal (non-elevated) process
 -- like OBS still read basic info — such as the exe name — from a
 -- process running with higher privileges (Administrator), which is
 -- common for games with anti-cheat. Without this, OpenProcess silently
 -- fails for elevated games and everything falls back to "Unsorted".
-local PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+C.PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
 -- MoveFileExA flags
-local MOVEFILE_COPY_ALLOWED     = 0x2 -- allows the move to work across drives too
-local ERROR_ALREADY_EXISTS      = 183
-local ERROR_SHARING_VIOLATION   = 32
-local ERROR_LOCK_VIOLATION      = 33
-local CP_UTF8                   = 65001
-local MOVE_RETRY_ATTEMPTS       = 6
-local MOVE_RETRY_DELAY_MS       = 300
-local MONITOR_DEFAULTTONEAREST  = 0x2
-local INVALID_FILE_ATTRIBUTES   = 0xFFFFFFFF
-local FILE_ATTRIBUTE_HIDDEN     = 0x2
+C.MOVEFILE_COPY_ALLOWED     = 0x2 -- allows the move to work across drives too
+C.ERROR_ALREADY_EXISTS      = 183
+C.ERROR_SHARING_VIOLATION   = 32
+C.ERROR_LOCK_VIOLATION      = 33
+C.CP_UTF8                   = 65001
+C.MOVE_RETRY_ATTEMPTS       = 6
+C.MOVE_RETRY_DELAY_MS       = 300
+C.MONITOR_DEFAULTTONEAREST  = 0x2
+C.INVALID_FILE_ATTRIBUTES   = 0xFFFFFFFF
+C.FILE_ATTRIBUTE_HIDDEN     = 0x2
 
 -- WinHTTP constants for the optional Steam lookup (see steam_lookup_name
 -- further down). Timeouts are intentionally short-ish: this call can run
 -- on OBS's frontend-event thread, so a slow/unreachable network should
 -- not be able to stall OBS for long. Worst case (each phase timing out
 -- in sequence) is bounded to roughly the sum of these four values.
-local WINHTTP_ACCESS_TYPE_DEFAULT_PROXY = 0
-local WINHTTP_FLAG_SECURE               = 0x00800000
+C.WINHTTP_ACCESS_TYPE_DEFAULT_PROXY = 0
+C.WINHTTP_FLAG_SECURE               = 0x00800000
 -- Kept short on purpose -- this call runs synchronously on OBS's
 -- frontend-event thread (the same thread that has to restart the Replay
 -- Buffer right after), so a slow/unreachable connection blocks the
@@ -280,15 +280,15 @@ local WINHTTP_FLAG_SECURE               = 0x00800000
 -- only ever runs at all for a genuinely new, never-before-seen exe with
 -- no window title -- everything else is served from KNOWN_GAMES/
 -- known_games.txt without touching the network.
-local STEAM_RESOLVE_TIMEOUT_MS          = 500
-local STEAM_CONNECT_TIMEOUT_MS          = 500
-local STEAM_SEND_TIMEOUT_MS             = 500
-local STEAM_RECEIVE_TIMEOUT_MS          = 800
+C.STEAM_RESOLVE_TIMEOUT_MS          = 500
+C.STEAM_CONNECT_TIMEOUT_MS          = 500
+C.STEAM_SEND_TIMEOUT_MS             = 500
+C.STEAM_RECEIVE_TIMEOUT_MS          = 800
 
 -- Wide-char buffer size for the exe path. 32760 (not the old 260/MAX_PATH)
 -- so deeply nested Steam/library paths or long-path-enabled installs
 -- don't get silently truncated.
-local EXE_PATH_BUF_LEN          = 32760
+C.EXE_PATH_BUF_LEN          = 32760
 
 -- Reads the real window title (e.g. "ELDEN RING", "Counter-Strike 2") --
 -- the same signal NVIDIA/Windows Game Bar use to recognize a game,
@@ -299,25 +299,26 @@ local EXE_PATH_BUF_LEN          = 32760
 -- a subtitle, build string or server name appended). A truncated title
 -- produced a truncated folder name, and if the cut-off point ever moved
 -- the same game earned itself a second folder.
-local TITLE_BUF_LEN = 1024
-local title_wbuf = ffi and ffi.new("WCHAR[?]", TITLE_BUF_LEN) or nil
+C.TITLE_BUF_LEN = 1024
+local title_wbuf = ffi and ffi.new("WCHAR[?]", C.TITLE_BUF_LEN) or nil
 local class_wbuf = ffi and ffi.new("WCHAR[?]", 260) or nil
+-- Reused UTF-8 output buffer (1024 wide chars -> at most 3 bytes each): no allocation per poll.
+local U8_BUF_LEN = 4096
+local u8_buf = ffi and ffi.new("char[?]", U8_BUF_LEN) or nil
 
 local function get_window_title(hwnd)
     local wbuf = title_wbuf
-    local len = user32.GetWindowTextW(hwnd, wbuf, TITLE_BUF_LEN)
+    local len = user32.GetWindowTextW(hwnd, wbuf, C.TITLE_BUF_LEN)
     if len <= 0 then
         return nil
     end
 
     -- Ask how many bytes the UTF-8 conversion needs, then convert.
-    local needed = kernel32.WideCharToMultiByte(CP_UTF8, 0, wbuf, len, nil, 0, nil, nil)
+    local needed = kernel32.WideCharToMultiByte(C.CP_UTF8, 0, wbuf, len, u8_buf, U8_BUF_LEN, nil, nil)
     if needed <= 0 then
         return nil
     end
-    local buf = ffi.new("char[?]", needed)
-    kernel32.WideCharToMultiByte(CP_UTF8, 0, wbuf, len, buf, needed, nil, nil)
-    local title = ffi.string(buf, needed)
+    local title = ffi.string(u8_buf, needed)
 
     -- Strip trademark/registered symbols (™ / ®) some games include in
     -- their title text, and trim whitespace.
@@ -352,12 +353,12 @@ function utf8_to_wide(str)
         empty[0] = 0
         return empty
     end
-    local needed = kernel32.MultiByteToWideChar(CP_UTF8, 0, str, #str, nil, 0)
+    local needed = kernel32.MultiByteToWideChar(C.CP_UTF8, 0, str, #str, nil, 0)
     if needed <= 0 then
         return nil
     end
     local wbuf = ffi.new("WCHAR[?]", needed + 1)
-    kernel32.MultiByteToWideChar(CP_UTF8, 0, str, #str, wbuf, needed)
+    kernel32.MultiByteToWideChar(C.CP_UTF8, 0, str, #str, wbuf, needed)
     wbuf[needed] = 0
     return wbuf
 end
@@ -424,7 +425,7 @@ if sorter_available then
     function W.exists(path)
         local wide = utf8_to_wide(path)
         if not wide then return false end
-        return tonumber(kernel32.GetFileAttributesW(wide)) ~= INVALID_FILE_ATTRIBUTES
+        return tonumber(kernel32.GetFileAttributesW(wide)) ~= C.INVALID_FILE_ATTRIBUTES
     end
 
     function W.remove(path)
@@ -441,10 +442,10 @@ if sorter_available then
         local wbuf = ffi.new("WCHAR[?]", needed)
         local len = kernel32.GetEnvironmentVariableW(wname, wbuf, needed)
         if len == 0 then return nil end
-        local bytes = kernel32.WideCharToMultiByte(CP_UTF8, 0, wbuf, len, nil, 0, nil, nil)
+        local bytes = kernel32.WideCharToMultiByte(C.CP_UTF8, 0, wbuf, len, nil, 0, nil, nil)
         if bytes <= 0 then return nil end
         local out = ffi.new("char[?]", bytes)
-        kernel32.WideCharToMultiByte(CP_UTF8, 0, wbuf, len, out, bytes, nil, nil)
+        kernel32.WideCharToMultiByte(C.CP_UTF8, 0, wbuf, len, out, bytes, nil, nil)
         return ffi.string(out, bytes)
     end
 end
@@ -457,13 +458,11 @@ local function get_window_class(hwnd)
     if len <= 0 then
         return nil
     end
-    local needed = kernel32.WideCharToMultiByte(CP_UTF8, 0, wbuf, len, nil, 0, nil, nil)
+    local needed = kernel32.WideCharToMultiByte(C.CP_UTF8, 0, wbuf, len, u8_buf, U8_BUF_LEN, nil, nil)
     if needed <= 0 then
         return nil
     end
-    local buf = ffi.new("char[?]", needed)
-    kernel32.WideCharToMultiByte(CP_UTF8, 0, wbuf, len, buf, needed, nil, nil)
-    return ffi.string(buf, needed):lower()
+    return ffi.string(u8_buf, needed):lower()
 end
 
 -- The desktop shell windows -- always exactly full-screen, never a game.
@@ -489,7 +488,7 @@ local function is_window_fullscreen(hwnd)
         return false
     end
 
-    local hmon = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+    local hmon = user32.MonitorFromWindow(hwnd, C.MONITOR_DEFAULTTONEAREST)
     if hmon == nil then
         return false
     end
@@ -513,13 +512,13 @@ end
 -- log under thousands of identical lines per gaming session, which made
 -- every OTHER message in it unfindable. Each distinct message is now
 -- logged at most once per minute.
-local LOG_THROTTLE_NS = 60 * 1e9
+C.LOG_THROTTLE_NS = 60 * 1e9
 local last_logged_at = {}
 
 local function log_throttled(msg)
     local now = obs.os_gettime_ns()
     local previous = last_logged_at[msg]
-    if previous and (now - previous) < LOG_THROTTLE_NS then
+    if previous and (now - previous) < C.LOG_THROTTLE_NS then
         return
     end
     last_logged_at[msg] = now
@@ -531,14 +530,14 @@ end
 -- outside the ffi.cdef above, can put a real dialog on screen without
 -- redeclaring the whole FFI layer a second time.
 --
--- MB_YESNOCANCEL is deliberate: Windows does not allow MessageBox button
+-- C.MB_YESNOCANCEL is deliberate: Windows does not allow MessageBox button
 -- captions to be renamed, so what each of the three buttons means is
 -- spelled out in the message text rather than left to be guessed from
 -- "Yes / No / Cancel".
-local MB_YESNOCANCEL   = 0x00000003
-local MB_ICONQUESTION  = 0x00000020
-local MB_SETFOREGROUND = 0x00010000
-local MB_TOPMOST       = 0x00040000
+C.MB_YESNOCANCEL   = 0x00000003
+C.MB_ICONQUESTION  = 0x00000020
+C.MB_SETFOREGROUND = 0x00010000
+C.MB_TOPMOST       = 0x00040000
 
 Sorter.MB_IDYES    = 6
 Sorter.MB_IDNO     = 7
@@ -552,7 +551,7 @@ function Sorter.ask_yes_no_cancel(text, caption)
     end
     local ok, result = pcall(function()
         return user32.MessageBoxW(nil, utf8_to_wide(text), utf8_to_wide(caption),
-            MB_YESNOCANCEL + MB_ICONQUESTION + MB_SETFOREGROUND + MB_TOPMOST)
+            C.MB_YESNOCANCEL + C.MB_ICONQUESTION + C.MB_SETFOREGROUND + C.MB_TOPMOST)
     end)
     if not ok then
         return nil
@@ -588,9 +587,13 @@ end
 -- 128 KB/second of pure garbage handed to the collector during a gaming
 -- session, for a value that is overwritten each time anyway. The same
 -- applies to the small DWORD scratch cells.
-local fg_exe_wbuf = ffi and ffi.new("WCHAR[?]", EXE_PATH_BUF_LEN) or nil
+local fg_exe_wbuf = ffi and ffi.new("WCHAR[?]", C.EXE_PATH_BUF_LEN) or nil
 local fg_size_cell = ffi and ffi.new("DWORD[1]") or nil
 local fg_pid_cell  = ffi and ffi.new("DWORD[1]") or nil
+-- The exe behind a pid never changes while that process lives, so the
+-- OpenProcess + QueryFullProcessImageName + UTF-8 conversion is done once per
+-- pid instead of twice a second (the 500 ms foreground poll).
+local exe_cache_pid, exe_cache_name, exe_cache_path = nil, nil, nil
 
 local function get_foreground_info()
     local hwnd = user32.GetForegroundWindow()
@@ -622,7 +625,11 @@ local function get_foreground_info()
         return nil
     end
 
-    local hproc = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid[0])
+    if exe_cache_pid == pid[0] then
+        return { exe_name = exe_cache_name, exe_path = exe_cache_path, window_title = window_title, is_fullscreen = fullscreen }
+    end
+
+    local hproc = kernel32.OpenProcess(C.PROCESS_QUERY_LIMITED_INFORMATION, 0, pid[0])
     if hproc == nil then
         return protected_fallback("OpenProcess failed for pid " .. tostring(pid[0]) ..
               " (protected/elevated process) -- using its window title.")
@@ -630,7 +637,7 @@ local function get_foreground_info()
 
     local wbuf = fg_exe_wbuf
     local size = fg_size_cell
-    size[0] = EXE_PATH_BUF_LEN
+    size[0] = C.EXE_PATH_BUF_LEN
     local ok = kernel32.QueryFullProcessImageNameW(hproc, 0, wbuf, size)
     kernel32.CloseHandle(hproc)
 
@@ -641,16 +648,17 @@ local function get_foreground_info()
     -- Convert the wide path to UTF-8 the same way get_window_title() does,
     -- so a non-English (e.g. Arabic) user/folder name in the exe's path
     -- comes through correctly instead of turning into mojibake.
-    local needed = kernel32.WideCharToMultiByte(CP_UTF8, 0, wbuf, size[0], nil, 0, nil, nil)
+    local needed = kernel32.WideCharToMultiByte(C.CP_UTF8, 0, wbuf, size[0], nil, 0, nil, nil)
     if needed <= 0 then
         return protected_fallback("couldn't convert exe path to UTF-8 for pid " .. tostring(pid[0]) .. ".")
     end
     local buf = ffi.new("char[?]", needed)
-    kernel32.WideCharToMultiByte(CP_UTF8, 0, wbuf, size[0], buf, needed, nil, nil)
+    kernel32.WideCharToMultiByte(C.CP_UTF8, 0, wbuf, size[0], buf, needed, nil, nil)
     local full_path = ffi.string(buf, needed)
 
     local exe_name = full_path:match("([^\\/]+)$") or full_path
     exe_name = (exe_name:gsub("%.[Ee][Xx][Ee]$", ""))
+    exe_cache_pid, exe_cache_name, exe_cache_path = pid[0], exe_name, full_path
 
     return { exe_name = exe_name, exe_path = full_path, window_title = window_title, is_fullscreen = fullscreen }
 end

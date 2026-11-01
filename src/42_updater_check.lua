@@ -140,7 +140,7 @@
             -- but that consent covers installing unattended, not
             -- cutting off a live stream/recording/Replay Buffer or
             -- yanking a fullscreen game to the desktop. relaunch_obs()
-            -- posts WM_CLOSE, and if outputs are active OBS's own
+            -- posts C.WM_CLOSE, and if outputs are active OBS's own
             -- shutdown path pops its "Active Outputs" confirmation --
             -- a modal dialog nobody is there to answer during an
             -- unattended auto-install. So: hold off and retry later
@@ -149,7 +149,7 @@
             auto_install_attempts = 0
             if outputs_are_active() or Sorter.foreground_is_fullscreen() then
                 last_check_result = "An update is staged but is being held back because a " ..
-                    "stream/recording/Replay Buffer is active (or a game is fullscreen) -- " ..
+                    "stream/recording is active (or a game is fullscreen) -- " ..
                     "it'll install automatically once that's no longer the case."
                 obs.script_log(obs.LOG_INFO, "OBS Clip Suite: " .. last_check_result)
                 obs.timer_remove(retry_auto_install)
@@ -280,6 +280,7 @@
         obs.obs_data_set_default_string(settings, "update_mode", "ask")
         obs.obs_data_set_default_string(settings, "skipped_update_version", "")
         obs.obs_data_set_default_string(settings, "last_backup_path", "")
+        obs.obs_data_set_default_string(settings, "backup_list", "")
     end
 
     function Updater.script_update(settings)

@@ -86,8 +86,10 @@ local function fg_poll_tick()
         -- instead of growing the table with one entry per poll tick.
         last.end_ns = now
     else
+        -- Entries tile the timeline: a new one starts exactly where the previous
+        -- one ended (no unattributed gap, and no zero-length first sample).
         fg_history[#fg_history + 1] = {
-            start_ns = now, end_ns = now,
+            start_ns = contiguous and last.end_ns or now, end_ns = now,
             exe_name = info.exe_name, exe_path = info.exe_path, window_title = info.window_title,
             is_fullscreen = info.is_fullscreen, protected = info.protected,
         }
@@ -122,6 +124,7 @@ local function get_dominant_foreground(seconds)
                 rec = { duration_ns = 0, info = entry }
                 totals[key] = rec
             end
+            rec.last_ns = entry.end_ns
             -- The history is chronological, so this ends up holding the LATEST
             -- sample of this app/window -- i.e. its most recent fullscreen
             -- state, which is what decides Desktop vs. game folder.
@@ -130,10 +133,11 @@ local function get_dominant_foreground(seconds)
         end
     end
 
-    local best, best_ns = nil, -1
+    -- Ties go to the app that was in front most recently (pairs() order is random).
+    local best, best_ns, best_last = nil, -1, -1
     for _, rec in pairs(totals) do
-        if rec.duration_ns > best_ns then
-            best, best_ns = rec.info, rec.duration_ns
+        if rec.duration_ns > best_ns or (rec.duration_ns == best_ns and rec.last_ns > best_last) then
+            best, best_ns, best_last = rec.info, rec.duration_ns, rec.last_ns
         end
     end
     return best
@@ -329,7 +333,7 @@ local function load_known_games()
             "-- through the Steam lookup are added below. Reload the script (or\n" ..
             "-- restart OBS) to pick up changes.\n"
         if W.write_file(path, header) then
-            kernel32.SetFileAttributesW(utf8_to_wide(path), FILE_ATTRIBUTE_HIDDEN)
+            kernel32.SetFileAttributesW(utf8_to_wide(path), C.FILE_ATTRIBUTE_HIDDEN)
         else
             print("OBS Replay Organizer: couldn't create " .. path .. " -- using built-in defaults only.")
         end
@@ -347,7 +351,7 @@ local function load_known_games()
     -- Also (re-)apply the hidden attribute here for anyone who already
     -- had known_games.txt from before this was added on creation -- a
     -- no-op if it's already hidden.
-    kernel32.SetFileAttributesW(utf8_to_wide(path), FILE_ATTRIBUTE_HIDDEN)
+    kernel32.SetFileAttributesW(utf8_to_wide(path), C.FILE_ATTRIBUTE_HIDDEN)
     return map
 end
 
@@ -394,6 +398,7 @@ local function sanitize(name)
     name = name:gsub("\194\160", " ")       -- U+00A0 non-breaking space -> normal space
     name = name:gsub("\9", " ")             -- tab -> normal space
     name = name:gsub("\13", " "):gsub("\10", " ") -- stray CR/LF -> space
+    name = name:gsub("[%z\1-\31\127]", " ")        -- any other control character (invalid in file names)
     -- Each of these is matched as one whole multi-byte UTF-8 sequence via
     -- its own plain gsub, NOT inside a [...] class -- a character class
     -- matches byte-by-byte, and these symbols' bytes could otherwise
@@ -519,8 +524,18 @@ local function add_mapping_clicked(props, property)
     end
 
     local existing = obs.obs_data_get_string(current_settings, "name_map")
+    friendly = friendly:gsub("[\r\n=]", " ")
     local new_line = raw .. "=" .. friendly
-    local updated = (existing == nil or existing == "") and new_line or (existing .. "\n" .. new_line)
+    -- Replace any older line for the same exe instead of piling up duplicates.
+    local kept = {}
+    for line in (existing or ""):gmatch("[^\r\n]+") do
+        local old_raw = line:match("^%s*(.-)%s*=")
+        if not (old_raw and old_raw:lower() == raw:lower()) then
+            kept[#kept + 1] = line
+        end
+    end
+    kept[#kept + 1] = new_line
+    local updated = table.concat(kept, "\n")
 
     obs.obs_data_set_string(current_settings, "name_map", updated)
     obs.obs_data_set_string(current_settings, "new_raw", "")
@@ -678,7 +693,9 @@ end
 -- This one generic rule covers any app without needing to hardcode it.
 local TITLE_SEPARATORS = { " - ", " | ", " — " }
 
-local function extract_stable_app_name(title)
+-- keep_whole = true: the window is a fullscreen game, so a " - " in its title is
+-- part of the game's name ("Hollow Knight - Silksong"), not an app-name suffix.
+local function extract_stable_app_name(title, keep_whole)
     -- Old Source-engine and some other games append the graphics API to the
     -- title ("Team Fortress 2 - Direct3D 9"). That suffix is not the app's
     -- name, so drop it first instead of letting it become the folder name.
@@ -689,6 +706,9 @@ local function extract_stable_app_name(title)
         stripped = stripped:gsub("%s+[%-|]%s+[Dd]irect[Xx]%s*[%d%.]*%s*$", "")
         if stripped == title or stripped == "" then break end
         title = stripped
+    end
+    if keep_whole then
+        return title
     end
     local best_pos, best_end = nil, nil
     for _, sep in ipairs(TITLE_SEPARATORS) do

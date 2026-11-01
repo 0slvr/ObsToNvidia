@@ -7,9 +7,13 @@ GitHub Releases. Each module has its own group and on/off checkbox.
 --]]
 
 -- Bump on every GitHub Release (compared numerically: 1.10.0 > 1.9.0).
-local VERSION = "2.13"
+local VERSION = "2.14"
 
 obs = obslua
+
+-- Constants shared by all parts live in ONE table (a single chunk-level local):
+-- LuaJIT allows at most 200 locals per function and this file was near the limit.
+local C = {}
 
 -- No FFI (non-LuaJIT build): the Organizer disables itself, the rest keeps working.
 local ffi_ok, ffi = pcall(require, "ffi")

@@ -54,7 +54,8 @@ Sorts every saved clip into a subfolder named after the game or app you were act
 - Handles non-ASCII (e.g. Arabic) folder names and paths.
 - **Custom names:** in the group, type the current folder name, type the new name, press **Add**. Your entries are saved with the script's settings.
 - **Known games list:** a built-in list is merged with your own entries in `known_games.txt` (in `%APPDATA%\obs-studio\script-data\OBS-Clip-Suite`). Reload the script after editing it.
-- **Steam lookup (optional):** as a last resort, unknown games can be looked up on the Steam Store by name. Results are remembered in `known_games.txt`. Turn it off with *Look up unknown games on Steam*.
+- **Game names:** your own names > built-in/known_games.txt > the game's window title > the Steam install folder name (offline) > Steam lookup.
+- **Steam lookup (optional):** only when a game has no window title and no Steam folder, unknown games can be looked up on the Steam Store by name. Results are remembered in `known_games.txt`. Turn it off with *Look up unknown games on Steam*.
 
 ### 3) Clip Alert Sound
 

@@ -22,9 +22,9 @@
         end
     end
 
-    local SW_SHOWNORMAL = 1
-    local WM_CLOSE = 0x0010
-    local GW_OWNER = 4
+    C.SW_SHOWNORMAL = 1
+    C.WM_CLOSE = 0x0010
+    C.GW_OWNER = 4
 
     -- Finds OBS's own MAIN window. It can't just take the first visible
     -- window of this process: the Scripts window, dialogs and floating
@@ -39,7 +39,7 @@
         local own_pid = kernel32.GetCurrentProcessId()
         local found = nil
         local cb = ffi.cast("WNDENUMPROC", function(hwnd, _lparam)
-            if user32.IsWindowVisible(hwnd) ~= 0 and user32.GetWindow(hwnd, GW_OWNER) == nil then
+            if user32.IsWindowVisible(hwnd) ~= 0 and user32.GetWindow(hwnd, C.GW_OWNER) == nil then
                 local pid = ffi.new("DWORD[1]")
                 user32.GetWindowThreadProcessId(hwnd, pid)
                 if pid[0] == own_pid then
@@ -149,12 +149,12 @@
                 wargs = built
             end
 
-            local result = shell32.ShellExecuteW(nil, nil, wbuf, wargs, wdir, SW_SHOWNORMAL)
+            local result = shell32.ShellExecuteW(nil, nil, wbuf, wargs, wdir, C.SW_SHOWNORMAL)
             if tonumber(ffi.cast("intptr_t", result)) <= 32 then
                 error("ShellExecuteW couldn't start a new OBS instance")
             end
 
-            user32.PostMessageW(main_hwnd, WM_CLOSE, 0, 0)
+            user32.PostMessageW(main_hwnd, C.WM_CLOSE, 0, 0)
         end)
         if not ok then
             if marker_written then
@@ -264,6 +264,12 @@
                     if not ok2 then
                         last_check_result = "Couldn't install the update automatically (" .. tostring(err2) ..
                             "). Get it here: " .. RELEASES_URL
+                        -- Same fallback as the no-buffer path: keep the download somewhere writable.
+                        local fb = fallback_update_path()
+                        if fb and W.write_file(fb, content) then
+                            last_check_result = last_check_result .. " The new version was also saved to " .. fb ..
+                                " -- copy it over the old file yourself."
+                        end
                         obs.script_log(obs.LOG_WARNING, "OBS Clip Suite: " .. last_check_result)
                     end
                 elseif tries >= 30 then

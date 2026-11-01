@@ -7,9 +7,13 @@ GitHub Releases. Each module has its own group and on/off checkbox.
 --]]
 
 -- Bump on every GitHub Release (compared numerically: 1.10.0 > 1.9.0).
-local VERSION = "2.13"
+local VERSION = "2.14"
 
 obs = obslua
+
+-- Constants shared by all parts live in ONE table (a single chunk-level local):
+-- LuaJIT allows at most 200 locals per function and this file was near the limit.
+local C = {}
 
 -- No FFI (non-LuaJIT build): the Organizer disables itself, the rest keeps working.
 local ffi_ok, ffi = pcall(require, "ffi")
@@ -79,63 +83,211 @@ local function read_update_marker()
 end
 
 ----------------------------------------------------------------------
--- MODULE 1: Replay Buffer Restarter
+-- MODULE 1: Replay Buffer Restarter  (adaptive, event-driven, self-healing)
+--
+-- Nothing to configure. It watches what actually happens and adapts:
+--  * Never stops the buffer while a save is still being written
+--    (SAVING / SAVED events), so hotkey spam can't catch it mid-save.
+--  * Bursts: if you save in quick succession it waits a short quiet period
+--    taken from your own rhythm; a single save restarts at once.
+--  * Learns the pause between "stopped" and "start again", and how long your
+--    PC takes to start the buffer (retries are timed from that, so a slow start
+--    is never "helped" with a second start call). The learned values are
+--    saved with the script settings and survive an OBS restart.
+--  * Leaves the buffer alone if YOU stop it while a restart is pending.
+--  * Self-healing: if the buffer doesn't come back, it keeps trying in the
+--    background (growing intervals) instead of silently staying OFF; it also
+--    restarts the buffer if our own stop completes late, after we gave up waiting.
+--  * Circuit breaker: after 3 restart cycles in a row that needed recovery it
+--    pauses itself (and says so in the log) instead of fighting a broken setup.
+--    Toggle the module off and on again to resume.
 ----------------------------------------------------------------------
 local Restarter = {}
 do
     local enabled = true
-    local teardown_until = 0 -- ms; the buffer is left alone until then
+    local auto_paused = false      -- circuit breaker
+    local teardown_until = 0       -- ms; the buffer is left alone until then
+    local settings_ref = nil       -- script settings, used to persist what was learned
 
-    local WATCHDOG_MS = 250
-    local GRACE_MS = 1000        -- wait this long for the STOPPED event before polling instead
+    local WATCHDOG_MS = 100
+    local GRACE_MS = 1000          -- wait this long for the STOPPED event before polling instead
     local MAX_STOP_WAIT_MS = 8000
-    local RETRY_BASE_MS = 250    -- start retries wait 250, 500, 1000, 2000 ms, then give up
-    local MAX_RETRIES = 3
+    local MAX_RETRIES = 3          -- normal start retries before background recovery takes over
     local STALE_MS = 25000
     local TEARDOWN_MS = 30000
+    local OUR_STOP_WINDOW_MS = 60000
+    local BURST_GAP_MS = 3000      -- two saves closer than this count as a burst
+    local MIN_QUIET_MS = 300
+    local MAX_QUIET_MS = 2500
+    local MAX_SETTLE_MS = 2000
+    local RECOVER_STEPS_MS = { 2000, 4000, 8000, 15000, 30000 }
+    local MAX_RECOVER_TRIES = 12
+    local BREAKER_LIMIT = 3
 
-    local phase = "idle" -- "idle" | "stopping" | "starting"
-    local phase_started, last_start, retries = 0, 0, 0
+    local phase = "idle" -- "idle" | "waiting" | "stopping" | "starting" | "recovering"
+    local phase_started, last_start, first_start_at, retries = 0, 0, 0, 0
     local watchdog
+
+    local pending_saves, last_saving_at = 0, 0
+    local save_times = {}      -- timestamps of the last few saves (ms)
+    local quiet_until = 0
+    local stopped_at = nil     -- STOPPED arrived but the learned settle time hasn't passed yet
+    local our_stop_until = 0   -- a STOPPED event before this time is the result of OUR stop
+    local recover_n, recover_next = 0, 0
+    local consecutive_bad = 0
+    local starting_seen = false -- OBS confirmed (STARTING event) that it is busy starting the buffer
+
+    -- learned values (persisted)
+    local settle_ms = 0        -- pause between stop and start
+    local start_ms = 600       -- how long the buffer takes to start on this PC
+    local repeat_rate = 0      -- how often one save is followed by another within BURST_GAP_MS (0..1)
 
     local function now() return obs.os_gettime_ns() / 1e6 end
     local function is_active() return obs.obs_frontend_replay_buffer_active() end
     local function tearing() return now() < teardown_until end
 
-    local function finish(warning)
+    local function save_learned()
+        if settings_ref ~= nil then
+            obs.obs_data_set_string(settings_ref, "restarter_learned",
+                string.format("%.0f;%.3f;%.0f", settle_ms, repeat_rate, start_ms))
+        end
+    end
+
+    local function load_learned(settings)
+        local text = obs.obs_data_get_string(settings, "restarter_learned")
+        local a, b, c = (text or ""):match("^(%d+);([%d%.]+);(%d+)$")
+        if a then
+            settle_ms = math.min(MAX_SETTLE_MS, tonumber(a))
+            repeat_rate = math.min(1, tonumber(b))
+            start_ms = math.min(10000, math.max(200, tonumber(c)))
+        end
+    end
+
+    local function finish(warning, keep_stop_flag)
         obs.timer_remove(watchdog)
         phase = "idle"
+        stopped_at = nil
+        if not keep_stop_flag then our_stop_until = 0 end
         if warning then obs.script_log(obs.LOG_WARNING, "Replay Buffer Restarter: " .. warning) end
+    end
+
+    -- Learns from how the last restart went.
+    local function tune(retries_needed, took_ms)
+        if retries_needed > 0 then
+            settle_ms = math.min(MAX_SETTLE_MS, math.max(250, settle_ms * 2))
+        else
+            settle_ms = settle_ms * 0.7
+            if settle_ms < 50 then settle_ms = 0 end
+            start_ms = math.min(10000, math.max(200, start_ms * 0.7 + took_ms * 0.3))
+        end
+        save_learned()
+    end
+
+    local function succeeded()
+        local clean = retries == 0
+        tune(retries, now() - first_start_at)
+        if clean then consecutive_bad = 0 end
+        finish()
     end
 
     local function start_buffer(fresh)
         last_start = now()
         if fresh then
             phase, phase_started, retries = "starting", last_start, 0
+            first_start_at = last_start
         else
             retries = retries + 1
         end
+        stopped_at = nil
+        starting_seen = false
         obs.obs_frontend_replay_buffer_start()
+    end
+
+    -- The normal restart failed: keep trying in the background, with growing
+    -- gaps, so the buffer is never silently left OFF.
+    local function begin_recovery(reason)
+        consecutive_bad = consecutive_bad + 1
+        settle_ms = math.min(MAX_SETTLE_MS, math.max(500, settle_ms * 2))
+        save_learned()
+        phase, recover_n, recover_next = "recovering", 0, now()
+        stopped_at = nil
+        obs.script_log(obs.LOG_WARNING, "Replay Buffer Restarter: " .. reason ..
+            " -- retrying in the background.")
+        if consecutive_bad >= BREAKER_LIMIT then
+            auto_paused = true
+            obs.script_log(obs.LOG_WARNING,
+                "Replay Buffer Restarter: restarts failed " .. consecutive_bad ..
+                " times in a row -- auto-restart paused for this session. Untick and tick " ..
+                "\"1) Replay Buffer Restarter\" to resume.")
+        end
+        obs.timer_remove(watchdog)
+        obs.timer_add(watchdog, WATCHDOG_MS)
+    end
+
+    local function begin_stop()
+        if not is_active() then
+            return finish()
+        end
+        phase, phase_started = "stopping", now()
+        stopped_at = nil
+        our_stop_until = now() + OUR_STOP_WINDOW_MS
+        obs.obs_frontend_replay_buffer_stop()
     end
 
     local function step()
         if tearing() then
             finish()
+        elseif phase == "waiting" then
+            if pending_saves > 0 then
+                if now() - last_saving_at > STALE_MS then
+                    pending_saves = 0 -- a SAVED event got lost; don't wait forever
+                else
+                    return
+                end
+            end
+            if now() >= quiet_until then
+                begin_stop()
+            end
         elseif phase == "stopping" then
             local waited = now() - phase_started
-            if waited >= GRACE_MS and not is_active() then
+            if stopped_at then
+                if now() - stopped_at >= settle_ms then
+                    start_buffer(true)
+                end
+            elseif waited >= GRACE_MS and not is_active() then
                 start_buffer(true)
             elseif waited >= MAX_STOP_WAIT_MS then
-                finish("the buffer did not stop in time -- restart skipped.")
+                -- Still not stopped. Leave it (a running buffer is harmless); if
+                -- our stop completes later, on_event() restarts it.
+                finish("the buffer did not stop in time -- restart skipped.", true)
             end
         elseif phase == "starting" then
             if is_active() then
+                succeeded()
+            else
+                -- Retries are timed from how long a start normally takes here, so a
+                -- slow-but-working start never gets a second start call on top of it.
+                local wait = math.max(800, start_ms * 2) * 2 ^ retries
+                if starting_seen then wait = math.max(wait, 8000) end -- OBS says it IS starting: just wait
+                if now() - last_start >= wait then
+                    if retries >= MAX_RETRIES then
+                        begin_recovery("the buffer did not come back")
+                    else
+                        start_buffer(false)
+                    end
+                end
+            end
+        elseif phase == "recovering" then
+            if is_active() then
+                obs.script_log(obs.LOG_INFO, "Replay Buffer Restarter: the buffer is running again.")
                 finish()
-            elseif now() - last_start >= RETRY_BASE_MS * 2 ^ retries then
-                if retries >= MAX_RETRIES then
-                    finish("the buffer did not come back -- it may be OFF, start it manually.")
+            elseif now() >= recover_next then
+                if recover_n >= MAX_RECOVER_TRIES then
+                    finish("gave up restarting the Replay Buffer -- start it manually.")
                 else
-                    start_buffer(false)
+                    recover_n = recover_n + 1
+                    recover_next = now() + RECOVER_STEPS_MS[math.min(recover_n, #RECOVER_STEPS_MS)]
+                    obs.obs_frontend_replay_buffer_start()
                 end
             end
         else
@@ -152,16 +304,40 @@ do
     -- (OBS exiting, collection switch, self-update stopping the buffer).
     function Restarter.abort(ms)
         teardown_until = now() + (ms or TEARDOWN_MS)
+        pending_saves = 0
         finish()
     end
 
     function Restarter.on_replay_saved()
-        if not enabled or tearing() or not is_active() then return end
-        if phase ~= "idle" and now() - phase_started < STALE_MS then return end
-        phase, phase_started = "stopping", now()
+        if pending_saves > 0 then pending_saves = pending_saves - 1 end
+        if not enabled or auto_paused or tearing() or not is_active() then return end
+        if phase == "stopping" or phase == "starting" or phase == "recovering" then
+            if now() - phase_started < STALE_MS then return end
+        end
+
+        -- Burst detection: how fast were the last saves pressed?
+        local n = #save_times
+        local quiet = 0
+        if n >= 2 then
+            local gap = save_times[n] - save_times[n - 1]
+            if gap < BURST_GAP_MS then
+                quiet = math.min(MAX_QUIET_MS, math.max(MIN_QUIET_MS, gap * 0.9))
+            end
+        end
+        -- If you often press twice in a row, keep a short habit-based pause even
+        -- for the first press of a burst (a restart would eat the second press).
+        if repeat_rate > 0.25 then
+            quiet = math.max(quiet, math.min(MAX_QUIET_MS, repeat_rate * 900))
+        end
+        quiet_until = now() + quiet
+
+        phase, phase_started = "waiting", now()
         obs.timer_remove(watchdog)
         obs.timer_add(watchdog, WATCHDOG_MS)
-        obs.obs_frontend_replay_buffer_stop()
+        -- Nothing to wait for: stop right now instead of at the next watchdog tick.
+        if quiet <= 0 and pending_saves == 0 then
+            begin_stop()
+        end
     end
 
     function Restarter.on_event(event)
@@ -171,33 +347,77 @@ do
             Restarter.abort()
         elseif event == obs.OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGED then
             teardown_until = 0
-        elseif phase ~= "idle" then
-            if event == obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_STARTED then
-                finish()
-            elseif event == obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_STOPPED and phase == "stopping" then
-                start_buffer(true)
+        elseif obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_SAVING ~= nil
+            and event == obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_SAVING then
+            -- A save has begun (OBS 30.2+; on older versions this event doesn't
+            -- exist and the module simply relies on the quiet period).
+            local t = now()
+            if #save_times > 0 then
+                local followed = (t - save_times[#save_times]) < BURST_GAP_MS and 1 or 0
+                repeat_rate = repeat_rate * 0.8 + followed * 0.2
             end
+            pending_saves = pending_saves + 1
+            last_saving_at = t
+            save_times[#save_times + 1] = t
+            if #save_times > 4 then table.remove(save_times, 1) end
+            if phase == "waiting" then
+                quiet_until = math.huge -- recomputed when this save finishes
+            end
+        elseif phase == "waiting" then
+            -- Someone stopped the buffer while our restart was pending: that was
+            -- you, not us. Leave it stopped.
+            if event == obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_STOPPING
+                or event == obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_STOPPED then
+                finish()
+            end
+        elseif phase == "starting" or phase == "stopping" then
+            if event == obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_STARTING then
+                starting_seen = true
+            elseif event == obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_STARTED then
+                succeeded()
+            elseif event == obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_STOPPED and phase == "starting" then
+                starting_seen = false   -- that start attempt ended without a running buffer: normal retry timing
+            elseif event == obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_STOPPED and phase == "stopping" then
+                if settle_ms > 0 then
+                    stopped_at = now()   -- the watchdog starts it once the learned pause is over
+                else
+                    start_buffer(true)
+                end
+            end
+        elseif phase == "idle" and event == obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_STOPPED
+            and now() < our_stop_until and enabled and not auto_paused and not tearing() then
+            -- Our stop finished late (after we stopped waiting for it): bring the buffer back.
+            our_stop_until = 0
+            begin_recovery("the buffer stopped late after a restart request")
         end
     end
 
     function Restarter.script_defaults(settings)
         obs.obs_data_set_default_bool(settings, "restart_buffer_after_save", true)
+        obs.obs_data_set_default_string(settings, "restarter_learned", "")
     end
 
     function Restarter.script_update(settings)
+        local was_enabled = enabled
+        settings_ref = settings
         enabled = obs.obs_data_get_bool(settings, "restart_buffer_after_save")
+        if enabled and not was_enabled then
+            auto_paused, consecutive_bad = false, 0   -- ticking the box again resumes it
+        end
+        load_learned(settings)
     end
 
     function Restarter.script_unload()
         obs.timer_remove(watchdog)
-        local interrupted = phase ~= "idle" and not tearing()
+        local interrupted = (phase == "stopping" or phase == "starting" or phase == "recovering")
+            and not tearing()
         phase = "idle"
+        settings_ref = nil
         if interrupted and not is_active() then
             obs.obs_frontend_replay_buffer_start()
         end
     end
 end
-
 ----------------------------------------------------------------------
 -- MODULE 3: Clip Alert Sound  (shown as "3)" in the Scripts window)
 ----------------------------------------------------------------------
@@ -1911,7 +2131,34 @@ end
 -- stutter the first time each built-in sound is used. Verified to give
 -- byte-identical output to the old decoder over randomised round-trips,
 -- including every padding case.
+local function base64_decode_ffi(data)
+    data = data:gsub('[^A-Za-z0-9+/]', '')
+    local n = #data
+    local out = ffi.new("uint8_t[?]", math.floor(n * 3 / 4) + 3)
+    local vals = ffi.new("int8_t[256]", -1)
+    for i = 1, #B64_CHARS do vals[B64_CHARS:byte(i)] = i - 1 end
+    local bytes = ffi.new("uint8_t[?]", n + 1)
+    ffi.copy(bytes, data, n)
+    local o, acc, bits = 0, 0, 0
+    for i = 0, n - 1 do
+        local v = vals[bytes[i]]
+        if v < 0 then break end
+        acc = (acc * 64 + v) % 16777216   -- keep 24 bits at most
+        bits = bits + 6
+        if bits >= 8 then
+            bits = bits - 8
+            out[o] = math.floor(acc / 2 ^ bits) % 256
+            o = o + 1
+        end
+    end
+    return ffi.string(out, o)
+end
+
 local function base64_decode(data)
+    if ffi then
+        local ok, res = pcall(base64_decode_ffi, data)
+        if ok and #res > 0 then return res end
+    end
     data = data:gsub('[^A-Za-z0-9+/]', '')  -- also drops '=' padding
 
     local out, n = {}, 0
@@ -1994,12 +2241,12 @@ end
 -- second clip was saved while the first alert was still finishing) can
 -- deadlock. The timer runs on OBS's normal script thread instead.
 local alert_source = nil
+local prewarm_sound -- forward-declared (assigned inside the module block below)
 local alert_started_ns = 0
 local alert_seen_playing = false
 local ALERT_POLL_MS = 200
 
 local function clear_sound_channel()
-    obs.timer_remove(clear_sound_channel)
     obs.obs_set_output_source(SOUND_CHANNEL, nil)
     if alert_source ~= nil then
         obs.obs_source_release(alert_source)
@@ -2030,7 +2277,15 @@ local function poll_alert()
     end
 end
 
-local function do_sound_alert()
+local last_alert_ns = 0
+local ALERT_MIN_GAP_NS = 1.5e9   -- hotkey spam must not create a new audio source per press
+
+local function do_sound_alert(force)
+    local now_ns = obs.os_gettime_ns()
+    if not force and (now_ns - last_alert_ns) < ALERT_MIN_GAP_NS then
+        return
+    end
+    last_alert_ns = now_ns
     local path = custom_sound_path
     if path ~= nil and path ~= "" then
         -- A custom path that no longer exists (file renamed, drive
@@ -2113,7 +2368,7 @@ end
     -- the situation where you'd most want to audition a sound -- while
     -- setting it up, before switching the feature on.
     local function test_alert_clicked(props, property)
-        do_sound_alert()
+        do_sound_alert(true)
         return false
     end
 
@@ -2175,6 +2430,15 @@ end
     obs.obs_data_set_default_int(settings, "sound_channel", 63)
 end
 
+    -- Decode the chosen built-in sound shortly after load/changes, so the first
+    -- real alert doesn't stutter while it is being decoded.
+    prewarm_sound = function()
+        obs.timer_remove(prewarm_sound)
+        if alert_sound and (custom_sound_path == nil or custom_sound_path == "") then
+            pcall(builtin_sound_path_for, sound_choice_by_id(selected_sound_id))
+        end
+    end
+
     function Alert.script_update(settings)
     alert_sound = obs.obs_data_get_bool(settings, "alert_sound")
     selected_sound_id = obs.obs_data_get_string(settings, "selected_sound_id")
@@ -2203,6 +2467,8 @@ end
     if new_channel < 0 or new_channel > 63 then
         new_channel = 63
     end
+    obs.timer_remove(prewarm_sound)
+    obs.timer_add(prewarm_sound, 2000)
     if new_channel ~= SOUND_CHANNEL then
         obs.timer_remove(poll_alert)
         clear_sound_channel()
@@ -2212,7 +2478,13 @@ end
 
     function Alert.script_unload()
         obs.timer_remove(poll_alert)
+        obs.timer_remove(prewarm_sound)
         clear_sound_channel()
+        -- Remove the decoded temp copies of the built-in sounds.
+        for id, path in pairs(decoded_paths) do
+            W.remove(path)
+            decoded_paths[id] = nil
+        end
     end
 end
 
@@ -2232,7 +2504,7 @@ local sorter_available = (ffi ~= nil)
 -- module's do-block is invisible to code in a different module's
 -- do-block -- Lua would silently fall back to an unset *global*
 -- `kernel32`/`user32` there instead, which is what used to break the
--- self-restart after an update (kernel32) and then, after the WM_CLOSE
+-- self-restart after an update (kernel32) and then, after the C.WM_CLOSE
 -- fix, the graceful-close step too (user32 -- EnumWindows/
 -- IsWindowVisible/PostMessageW all live in user32, not kernel32).
 local kernel32, user32, shell32
@@ -2420,12 +2692,12 @@ HANDLE ShellExecuteW(HWND hwnd, const WCHAR* lpOperation, const WCHAR* lpFile,
    this is the one place in the whole script that reaches past OBS itself
    -- and only after a fresh copy is already starting up.
    This is done by finding this process's own main window and posting it
-   a normal WM_CLOSE, the same message Windows sends when the user clicks
+   a normal C.WM_CLOSE, the same message Windows sends when the user clicks
    the title-bar X -- NOT ExitProcess(), which used to hard-kill the
    process. A hard kill skips OBS's own shutdown path entirely, so it
    never gets to write the "clean exit" marker it checks on the next
    launch -- that's what was popping the "OBS Studio did not properly
-   shut down" / Safe Mode prompt after every self-update. WM_CLOSE lets
+   shut down" / Safe Mode prompt after every self-update. C.WM_CLOSE lets
    OBS run its real shutdown (save config, release the single-instance
    lock, mark the exit clean) before the process actually ends. */
 DWORD  GetCurrentProcessId();
@@ -2434,11 +2706,11 @@ typedef struct { DWORD dwLowDateTime; DWORD dwHighDateTime; } FILETIME;
 BOOL   GetProcessTimes(HANDLE hProcess, FILETIME* lpCreationTime, FILETIME* lpExitTime,
                        FILETIME* lpKernelTime, FILETIME* lpUserTime);
 BOOL   IsWindowVisible(HWND hWnd);
-typedef int (*WNDENUMPROC)(HWND, long);
-BOOL   EnumWindows(WNDENUMPROC lpEnumFunc, long lParam);
-BOOL   PostMessageW(HWND hWnd, unsigned int Msg, unsigned long wParam, long lParam);
+typedef int (*WNDENUMPROC)(HWND, intptr_t);
+BOOL   EnumWindows(WNDENUMPROC lpEnumFunc, intptr_t lParam);
+BOOL   PostMessageW(HWND hWnd, unsigned int Msg, uintptr_t wParam, intptr_t lParam);
 
-/* GetWindow(hWnd, GW_OWNER) tells an owned window (Scripts dialog, floating
+/* GetWindow(hWnd, C.GW_OWNER) tells an owned window (Scripts dialog, floating
    dock) from the real top-level main window, so relaunch_obs() closes OBS's
    main window and never one of those. */
 HWND   GetWindow(HWND hWnd, unsigned int uCmd);
@@ -2461,33 +2733,33 @@ if sorter_available then
     end
 end
 
--- PROCESS_QUERY_LIMITED_INFORMATION: unlike PROCESS_QUERY_INFORMATION,
+-- C.PROCESS_QUERY_LIMITED_INFORMATION: unlike PROCESS_QUERY_INFORMATION,
 -- this is specifically designed to let a normal (non-elevated) process
 -- like OBS still read basic info — such as the exe name — from a
 -- process running with higher privileges (Administrator), which is
 -- common for games with anti-cheat. Without this, OpenProcess silently
 -- fails for elevated games and everything falls back to "Unsorted".
-local PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+C.PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
 -- MoveFileExA flags
-local MOVEFILE_COPY_ALLOWED     = 0x2 -- allows the move to work across drives too
-local ERROR_ALREADY_EXISTS      = 183
-local ERROR_SHARING_VIOLATION   = 32
-local ERROR_LOCK_VIOLATION      = 33
-local CP_UTF8                   = 65001
-local MOVE_RETRY_ATTEMPTS       = 6
-local MOVE_RETRY_DELAY_MS       = 300
-local MONITOR_DEFAULTTONEAREST  = 0x2
-local INVALID_FILE_ATTRIBUTES   = 0xFFFFFFFF
-local FILE_ATTRIBUTE_HIDDEN     = 0x2
+C.MOVEFILE_COPY_ALLOWED     = 0x2 -- allows the move to work across drives too
+C.ERROR_ALREADY_EXISTS      = 183
+C.ERROR_SHARING_VIOLATION   = 32
+C.ERROR_LOCK_VIOLATION      = 33
+C.CP_UTF8                   = 65001
+C.MOVE_RETRY_ATTEMPTS       = 6
+C.MOVE_RETRY_DELAY_MS       = 300
+C.MONITOR_DEFAULTTONEAREST  = 0x2
+C.INVALID_FILE_ATTRIBUTES   = 0xFFFFFFFF
+C.FILE_ATTRIBUTE_HIDDEN     = 0x2
 
 -- WinHTTP constants for the optional Steam lookup (see steam_lookup_name
 -- further down). Timeouts are intentionally short-ish: this call can run
 -- on OBS's frontend-event thread, so a slow/unreachable network should
 -- not be able to stall OBS for long. Worst case (each phase timing out
 -- in sequence) is bounded to roughly the sum of these four values.
-local WINHTTP_ACCESS_TYPE_DEFAULT_PROXY = 0
-local WINHTTP_FLAG_SECURE               = 0x00800000
+C.WINHTTP_ACCESS_TYPE_DEFAULT_PROXY = 0
+C.WINHTTP_FLAG_SECURE               = 0x00800000
 -- Kept short on purpose -- this call runs synchronously on OBS's
 -- frontend-event thread (the same thread that has to restart the Replay
 -- Buffer right after), so a slow/unreachable connection blocks the
@@ -2498,15 +2770,15 @@ local WINHTTP_FLAG_SECURE               = 0x00800000
 -- only ever runs at all for a genuinely new, never-before-seen exe with
 -- no window title -- everything else is served from KNOWN_GAMES/
 -- known_games.txt without touching the network.
-local STEAM_RESOLVE_TIMEOUT_MS          = 500
-local STEAM_CONNECT_TIMEOUT_MS          = 500
-local STEAM_SEND_TIMEOUT_MS             = 500
-local STEAM_RECEIVE_TIMEOUT_MS          = 800
+C.STEAM_RESOLVE_TIMEOUT_MS          = 500
+C.STEAM_CONNECT_TIMEOUT_MS          = 500
+C.STEAM_SEND_TIMEOUT_MS             = 500
+C.STEAM_RECEIVE_TIMEOUT_MS          = 800
 
 -- Wide-char buffer size for the exe path. 32760 (not the old 260/MAX_PATH)
 -- so deeply nested Steam/library paths or long-path-enabled installs
 -- don't get silently truncated.
-local EXE_PATH_BUF_LEN          = 32760
+C.EXE_PATH_BUF_LEN          = 32760
 
 -- Reads the real window title (e.g. "ELDEN RING", "Counter-Strike 2") --
 -- the same signal NVIDIA/Windows Game Bar use to recognize a game,
@@ -2517,25 +2789,26 @@ local EXE_PATH_BUF_LEN          = 32760
 -- a subtitle, build string or server name appended). A truncated title
 -- produced a truncated folder name, and if the cut-off point ever moved
 -- the same game earned itself a second folder.
-local TITLE_BUF_LEN = 1024
-local title_wbuf = ffi and ffi.new("WCHAR[?]", TITLE_BUF_LEN) or nil
+C.TITLE_BUF_LEN = 1024
+local title_wbuf = ffi and ffi.new("WCHAR[?]", C.TITLE_BUF_LEN) or nil
 local class_wbuf = ffi and ffi.new("WCHAR[?]", 260) or nil
+-- Reused UTF-8 output buffer (1024 wide chars -> at most 3 bytes each): no allocation per poll.
+local U8_BUF_LEN = 4096
+local u8_buf = ffi and ffi.new("char[?]", U8_BUF_LEN) or nil
 
 local function get_window_title(hwnd)
     local wbuf = title_wbuf
-    local len = user32.GetWindowTextW(hwnd, wbuf, TITLE_BUF_LEN)
+    local len = user32.GetWindowTextW(hwnd, wbuf, C.TITLE_BUF_LEN)
     if len <= 0 then
         return nil
     end
 
     -- Ask how many bytes the UTF-8 conversion needs, then convert.
-    local needed = kernel32.WideCharToMultiByte(CP_UTF8, 0, wbuf, len, nil, 0, nil, nil)
+    local needed = kernel32.WideCharToMultiByte(C.CP_UTF8, 0, wbuf, len, u8_buf, U8_BUF_LEN, nil, nil)
     if needed <= 0 then
         return nil
     end
-    local buf = ffi.new("char[?]", needed)
-    kernel32.WideCharToMultiByte(CP_UTF8, 0, wbuf, len, buf, needed, nil, nil)
-    local title = ffi.string(buf, needed)
+    local title = ffi.string(u8_buf, needed)
 
     -- Strip trademark/registered symbols (™ / ®) some games include in
     -- their title text, and trim whitespace.
@@ -2570,12 +2843,12 @@ function utf8_to_wide(str)
         empty[0] = 0
         return empty
     end
-    local needed = kernel32.MultiByteToWideChar(CP_UTF8, 0, str, #str, nil, 0)
+    local needed = kernel32.MultiByteToWideChar(C.CP_UTF8, 0, str, #str, nil, 0)
     if needed <= 0 then
         return nil
     end
     local wbuf = ffi.new("WCHAR[?]", needed + 1)
-    kernel32.MultiByteToWideChar(CP_UTF8, 0, str, #str, wbuf, needed)
+    kernel32.MultiByteToWideChar(C.CP_UTF8, 0, str, #str, wbuf, needed)
     wbuf[needed] = 0
     return wbuf
 end
@@ -2642,7 +2915,7 @@ if sorter_available then
     function W.exists(path)
         local wide = utf8_to_wide(path)
         if not wide then return false end
-        return tonumber(kernel32.GetFileAttributesW(wide)) ~= INVALID_FILE_ATTRIBUTES
+        return tonumber(kernel32.GetFileAttributesW(wide)) ~= C.INVALID_FILE_ATTRIBUTES
     end
 
     function W.remove(path)
@@ -2659,10 +2932,10 @@ if sorter_available then
         local wbuf = ffi.new("WCHAR[?]", needed)
         local len = kernel32.GetEnvironmentVariableW(wname, wbuf, needed)
         if len == 0 then return nil end
-        local bytes = kernel32.WideCharToMultiByte(CP_UTF8, 0, wbuf, len, nil, 0, nil, nil)
+        local bytes = kernel32.WideCharToMultiByte(C.CP_UTF8, 0, wbuf, len, nil, 0, nil, nil)
         if bytes <= 0 then return nil end
         local out = ffi.new("char[?]", bytes)
-        kernel32.WideCharToMultiByte(CP_UTF8, 0, wbuf, len, out, bytes, nil, nil)
+        kernel32.WideCharToMultiByte(C.CP_UTF8, 0, wbuf, len, out, bytes, nil, nil)
         return ffi.string(out, bytes)
     end
 end
@@ -2675,13 +2948,11 @@ local function get_window_class(hwnd)
     if len <= 0 then
         return nil
     end
-    local needed = kernel32.WideCharToMultiByte(CP_UTF8, 0, wbuf, len, nil, 0, nil, nil)
+    local needed = kernel32.WideCharToMultiByte(C.CP_UTF8, 0, wbuf, len, u8_buf, U8_BUF_LEN, nil, nil)
     if needed <= 0 then
         return nil
     end
-    local buf = ffi.new("char[?]", needed)
-    kernel32.WideCharToMultiByte(CP_UTF8, 0, wbuf, len, buf, needed, nil, nil)
-    return ffi.string(buf, needed):lower()
+    return ffi.string(u8_buf, needed):lower()
 end
 
 -- The desktop shell windows -- always exactly full-screen, never a game.
@@ -2707,7 +2978,7 @@ local function is_window_fullscreen(hwnd)
         return false
     end
 
-    local hmon = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+    local hmon = user32.MonitorFromWindow(hwnd, C.MONITOR_DEFAULTTONEAREST)
     if hmon == nil then
         return false
     end
@@ -2731,13 +3002,13 @@ end
 -- log under thousands of identical lines per gaming session, which made
 -- every OTHER message in it unfindable. Each distinct message is now
 -- logged at most once per minute.
-local LOG_THROTTLE_NS = 60 * 1e9
+C.LOG_THROTTLE_NS = 60 * 1e9
 local last_logged_at = {}
 
 local function log_throttled(msg)
     local now = obs.os_gettime_ns()
     local previous = last_logged_at[msg]
-    if previous and (now - previous) < LOG_THROTTLE_NS then
+    if previous and (now - previous) < C.LOG_THROTTLE_NS then
         return
     end
     last_logged_at[msg] = now
@@ -2749,14 +3020,14 @@ end
 -- outside the ffi.cdef above, can put a real dialog on screen without
 -- redeclaring the whole FFI layer a second time.
 --
--- MB_YESNOCANCEL is deliberate: Windows does not allow MessageBox button
+-- C.MB_YESNOCANCEL is deliberate: Windows does not allow MessageBox button
 -- captions to be renamed, so what each of the three buttons means is
 -- spelled out in the message text rather than left to be guessed from
 -- "Yes / No / Cancel".
-local MB_YESNOCANCEL   = 0x00000003
-local MB_ICONQUESTION  = 0x00000020
-local MB_SETFOREGROUND = 0x00010000
-local MB_TOPMOST       = 0x00040000
+C.MB_YESNOCANCEL   = 0x00000003
+C.MB_ICONQUESTION  = 0x00000020
+C.MB_SETFOREGROUND = 0x00010000
+C.MB_TOPMOST       = 0x00040000
 
 Sorter.MB_IDYES    = 6
 Sorter.MB_IDNO     = 7
@@ -2770,7 +3041,7 @@ function Sorter.ask_yes_no_cancel(text, caption)
     end
     local ok, result = pcall(function()
         return user32.MessageBoxW(nil, utf8_to_wide(text), utf8_to_wide(caption),
-            MB_YESNOCANCEL + MB_ICONQUESTION + MB_SETFOREGROUND + MB_TOPMOST)
+            C.MB_YESNOCANCEL + C.MB_ICONQUESTION + C.MB_SETFOREGROUND + C.MB_TOPMOST)
     end)
     if not ok then
         return nil
@@ -2806,9 +3077,13 @@ end
 -- 128 KB/second of pure garbage handed to the collector during a gaming
 -- session, for a value that is overwritten each time anyway. The same
 -- applies to the small DWORD scratch cells.
-local fg_exe_wbuf = ffi and ffi.new("WCHAR[?]", EXE_PATH_BUF_LEN) or nil
+local fg_exe_wbuf = ffi and ffi.new("WCHAR[?]", C.EXE_PATH_BUF_LEN) or nil
 local fg_size_cell = ffi and ffi.new("DWORD[1]") or nil
 local fg_pid_cell  = ffi and ffi.new("DWORD[1]") or nil
+-- The exe behind a pid never changes while that process lives, so the
+-- OpenProcess + QueryFullProcessImageName + UTF-8 conversion is done once per
+-- pid instead of twice a second (the 500 ms foreground poll).
+local exe_cache_pid, exe_cache_name, exe_cache_path = nil, nil, nil
 
 local function get_foreground_info()
     local hwnd = user32.GetForegroundWindow()
@@ -2840,7 +3115,11 @@ local function get_foreground_info()
         return nil
     end
 
-    local hproc = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid[0])
+    if exe_cache_pid == pid[0] then
+        return { exe_name = exe_cache_name, exe_path = exe_cache_path, window_title = window_title, is_fullscreen = fullscreen }
+    end
+
+    local hproc = kernel32.OpenProcess(C.PROCESS_QUERY_LIMITED_INFORMATION, 0, pid[0])
     if hproc == nil then
         return protected_fallback("OpenProcess failed for pid " .. tostring(pid[0]) ..
               " (protected/elevated process) -- using its window title.")
@@ -2848,7 +3127,7 @@ local function get_foreground_info()
 
     local wbuf = fg_exe_wbuf
     local size = fg_size_cell
-    size[0] = EXE_PATH_BUF_LEN
+    size[0] = C.EXE_PATH_BUF_LEN
     local ok = kernel32.QueryFullProcessImageNameW(hproc, 0, wbuf, size)
     kernel32.CloseHandle(hproc)
 
@@ -2859,16 +3138,17 @@ local function get_foreground_info()
     -- Convert the wide path to UTF-8 the same way get_window_title() does,
     -- so a non-English (e.g. Arabic) user/folder name in the exe's path
     -- comes through correctly instead of turning into mojibake.
-    local needed = kernel32.WideCharToMultiByte(CP_UTF8, 0, wbuf, size[0], nil, 0, nil, nil)
+    local needed = kernel32.WideCharToMultiByte(C.CP_UTF8, 0, wbuf, size[0], nil, 0, nil, nil)
     if needed <= 0 then
         return protected_fallback("couldn't convert exe path to UTF-8 for pid " .. tostring(pid[0]) .. ".")
     end
     local buf = ffi.new("char[?]", needed)
-    kernel32.WideCharToMultiByte(CP_UTF8, 0, wbuf, size[0], buf, needed, nil, nil)
+    kernel32.WideCharToMultiByte(C.CP_UTF8, 0, wbuf, size[0], buf, needed, nil, nil)
     local full_path = ffi.string(buf, needed)
 
     local exe_name = full_path:match("([^\\/]+)$") or full_path
     exe_name = (exe_name:gsub("%.[Ee][Xx][Ee]$", ""))
+    exe_cache_pid, exe_cache_name, exe_cache_path = pid[0], exe_name, full_path
 
     return { exe_name = exe_name, exe_path = full_path, window_title = window_title, is_fullscreen = fullscreen }
 end
@@ -2961,8 +3241,10 @@ local function fg_poll_tick()
         -- instead of growing the table with one entry per poll tick.
         last.end_ns = now
     else
+        -- Entries tile the timeline: a new one starts exactly where the previous
+        -- one ended (no unattributed gap, and no zero-length first sample).
         fg_history[#fg_history + 1] = {
-            start_ns = now, end_ns = now,
+            start_ns = contiguous and last.end_ns or now, end_ns = now,
             exe_name = info.exe_name, exe_path = info.exe_path, window_title = info.window_title,
             is_fullscreen = info.is_fullscreen, protected = info.protected,
         }
@@ -2997,6 +3279,7 @@ local function get_dominant_foreground(seconds)
                 rec = { duration_ns = 0, info = entry }
                 totals[key] = rec
             end
+            rec.last_ns = entry.end_ns
             -- The history is chronological, so this ends up holding the LATEST
             -- sample of this app/window -- i.e. its most recent fullscreen
             -- state, which is what decides Desktop vs. game folder.
@@ -3005,10 +3288,11 @@ local function get_dominant_foreground(seconds)
         end
     end
 
-    local best, best_ns = nil, -1
+    -- Ties go to the app that was in front most recently (pairs() order is random).
+    local best, best_ns, best_last = nil, -1, -1
     for _, rec in pairs(totals) do
-        if rec.duration_ns > best_ns then
-            best, best_ns = rec.info, rec.duration_ns
+        if rec.duration_ns > best_ns or (rec.duration_ns == best_ns and rec.last_ns > best_last) then
+            best, best_ns, best_last = rec.info, rec.duration_ns, rec.last_ns
         end
     end
     return best
@@ -3204,7 +3488,7 @@ local function load_known_games()
             "-- through the Steam lookup are added below. Reload the script (or\n" ..
             "-- restart OBS) to pick up changes.\n"
         if W.write_file(path, header) then
-            kernel32.SetFileAttributesW(utf8_to_wide(path), FILE_ATTRIBUTE_HIDDEN)
+            kernel32.SetFileAttributesW(utf8_to_wide(path), C.FILE_ATTRIBUTE_HIDDEN)
         else
             print("OBS Replay Organizer: couldn't create " .. path .. " -- using built-in defaults only.")
         end
@@ -3222,7 +3506,7 @@ local function load_known_games()
     -- Also (re-)apply the hidden attribute here for anyone who already
     -- had known_games.txt from before this was added on creation -- a
     -- no-op if it's already hidden.
-    kernel32.SetFileAttributesW(utf8_to_wide(path), FILE_ATTRIBUTE_HIDDEN)
+    kernel32.SetFileAttributesW(utf8_to_wide(path), C.FILE_ATTRIBUTE_HIDDEN)
     return map
 end
 
@@ -3269,6 +3553,7 @@ local function sanitize(name)
     name = name:gsub("\194\160", " ")       -- U+00A0 non-breaking space -> normal space
     name = name:gsub("\9", " ")             -- tab -> normal space
     name = name:gsub("\13", " "):gsub("\10", " ") -- stray CR/LF -> space
+    name = name:gsub("[%z\1-\31\127]", " ")        -- any other control character (invalid in file names)
     -- Each of these is matched as one whole multi-byte UTF-8 sequence via
     -- its own plain gsub, NOT inside a [...] class -- a character class
     -- matches byte-by-byte, and these symbols' bytes could otherwise
@@ -3394,8 +3679,18 @@ local function add_mapping_clicked(props, property)
     end
 
     local existing = obs.obs_data_get_string(current_settings, "name_map")
+    friendly = friendly:gsub("[\r\n=]", " ")
     local new_line = raw .. "=" .. friendly
-    local updated = (existing == nil or existing == "") and new_line or (existing .. "\n" .. new_line)
+    -- Replace any older line for the same exe instead of piling up duplicates.
+    local kept = {}
+    for line in (existing or ""):gmatch("[^\r\n]+") do
+        local old_raw = line:match("^%s*(.-)%s*=")
+        if not (old_raw and old_raw:lower() == raw:lower()) then
+            kept[#kept + 1] = line
+        end
+    end
+    kept[#kept + 1] = new_line
+    local updated = table.concat(kept, "\n")
 
     obs.obs_data_set_string(current_settings, "name_map", updated)
     obs.obs_data_set_string(current_settings, "new_raw", "")
@@ -3553,7 +3848,9 @@ end
 -- This one generic rule covers any app without needing to hardcode it.
 local TITLE_SEPARATORS = { " - ", " | ", " — " }
 
-local function extract_stable_app_name(title)
+-- keep_whole = true: the window is a fullscreen game, so a " - " in its title is
+-- part of the game's name ("Hollow Knight - Silksong"), not an app-name suffix.
+local function extract_stable_app_name(title, keep_whole)
     -- Old Source-engine and some other games append the graphics API to the
     -- title ("Team Fortress 2 - Direct3D 9"). That suffix is not the app's
     -- name, so drop it first instead of letting it become the folder name.
@@ -3564,6 +3861,9 @@ local function extract_stable_app_name(title)
         stripped = stripped:gsub("%s+[%-|]%s+[Dd]irect[Xx]%s*[%d%.]*%s*$", "")
         if stripped == title or stripped == "" then break end
         title = stripped
+    end
+    if keep_whole then
+        return title
     end
     local best_pos, best_end = nil, nil
     for _, sep in ipairs(TITLE_SEPARATORS) do
@@ -3757,16 +4057,16 @@ end
 -- STEAM_*_TIMEOUT_MS constants above specifically because of that.
 -- Returns the response body as a string, or nil on any failure.
 -- WinHttpQueryHeaders selectors for the status-code read below.
-local WINHTTP_QUERY_STATUS_CODE   = 19
-local WINHTTP_QUERY_CONTENT_LENGTH = 5
-local WINHTTP_QUERY_FLAG_NUMBER   = 0x20000000
+C.WINHTTP_QUERY_STATUS_CODE   = 19
+C.WINHTTP_QUERY_CONTENT_LENGTH = 5
+C.WINHTTP_QUERY_FLAG_NUMBER   = 0x20000000
 
 -- Reads a numeric response header (status code, Content-Length) or nil.
 local function query_number_header(hRequest, selector)
     local value = ffi.new("DWORD[1]")
     local len = ffi.new("DWORD[1]", ffi.sizeof("DWORD"))
     local ok = winhttp.WinHttpQueryHeaders(hRequest,
-        selector + WINHTTP_QUERY_FLAG_NUMBER, nil, value, len, nil)
+        selector + C.WINHTTP_QUERY_FLAG_NUMBER, nil, value, len, nil)
     if ok == 0 then
         return nil
     end
@@ -3802,20 +4102,20 @@ local function https_get(host, path_and_query, timeouts)
 
     local ok, body = pcall(function()
         hSession = winhttp.WinHttpOpen(utf8_to_wide("OBS-ReplayOrganizer/1.0"),
-            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, nil, nil, 0)
+            C.WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, nil, nil, 0)
         if hSession == nil then return nil end
 
         winhttp.WinHttpSetTimeouts(hSession,
-            timeouts.resolve or STEAM_RESOLVE_TIMEOUT_MS,
-            timeouts.connect or STEAM_CONNECT_TIMEOUT_MS,
-            timeouts.send    or STEAM_SEND_TIMEOUT_MS,
-            timeouts.receive or STEAM_RECEIVE_TIMEOUT_MS)
+            timeouts.resolve or C.STEAM_RESOLVE_TIMEOUT_MS,
+            timeouts.connect or C.STEAM_CONNECT_TIMEOUT_MS,
+            timeouts.send    or C.STEAM_SEND_TIMEOUT_MS,
+            timeouts.receive or C.STEAM_RECEIVE_TIMEOUT_MS)
 
         hConnect = winhttp.WinHttpConnect(hSession, utf8_to_wide(host), 443, 0)
         if hConnect == nil then return nil end
 
         hRequest = winhttp.WinHttpOpenRequest(hConnect, utf8_to_wide("GET"),
-            utf8_to_wide(path_and_query), nil, nil, nil, WINHTTP_FLAG_SECURE)
+            utf8_to_wide(path_and_query), nil, nil, nil, C.WINHTTP_FLAG_SECURE)
         if hRequest == nil then return nil end
 
         local deadline_ns = timeouts.total and (obs.os_gettime_ns() + timeouts.total * 1e6) or nil
@@ -3830,10 +4130,10 @@ local function https_get(host, path_and_query, timeouts)
         -- response. For the Steam lookup that just meant a garbage game
         -- name; for the updater it meant GitHub's HTML "Not Found" page
         -- could be treated as the script.
-        local status = query_number_header(hRequest, WINHTTP_QUERY_STATUS_CODE)
+        local status = query_number_header(hRequest, C.WINHTTP_QUERY_STATUS_CODE)
         if status ~= nil and status ~= 200 and status ~= 206 then return nil end
 
-        local expected = query_number_header(hRequest, WINHTTP_QUERY_CONTENT_LENGTH)
+        local expected = query_number_header(hRequest, C.WINHTTP_QUERY_CONTENT_LENGTH)
 
         local chunks = {}
         local total = 0
@@ -3899,9 +4199,8 @@ local function persist_known_game(raw_exe_name, friendly)
         return
     end
 
-    -- friendly_name() calls this every time it resolves a name from a
-    -- window title. Without a duplicate check, a long session could append
-    -- the identical line dozens of times.
+    -- Only Steam lookups call this (never window-title names). The duplicate
+    -- check stops the same line being appended again within one session.
     local line = raw_exe_name .. "=" .. friendly
     if persisted_this_session[line] then
         return
@@ -4002,7 +4301,8 @@ local NON_GAME_EXES = {
 -- one of these (or in a folder literally named "Games"). Discord, Claude,
 -- browsers, editors... live in AppData / Program Files, so they never match.
 local GAME_LIBRARY_MARKERS = {
-    "\\steamapps\\common\\", "\\epic games\\", "\\gog galaxy\\games\\", "\\gog games\\",
+    "\\steamapps\\common\\", "\\steamlibrary\\", "\\epic games\\", "\\gog galaxy\\games\\", "\\gog games\\",
+    "\\battle.net\\", "\\blizzard entertainment\\", "\\amazon games\\library\\", "\\itch\\apps\\",
     "\\riot games\\", "\\ubisoft\\ubisoft game launcher\\games\\", "\\ea games\\",
     "\\origin games\\", "\\xboxgames\\", "\\rockstar games\\",
     "\\games\\",
@@ -4011,6 +4311,10 @@ local GAME_LIBRARY_MARKERS = {
 local function is_in_game_library(path)
     if not path or path == "" then return false end
     local p = path:lower():gsub("/", "\\")
+    -- The store launchers themselves also live under "Epic Games" etc.
+    if p:find("\\epic games\\launcher\\", 1, true) or p:find("\\epic online services\\", 1, true) then
+        return false
+    end
     for _, marker in ipairs(GAME_LIBRARY_MARKERS) do
         if p:find(marker, 1, true) then
             return true
@@ -4019,7 +4323,14 @@ local function is_in_game_library(path)
     return false
 end
 
-local function friendly_name(raw_exe_name, window_title, is_fullscreen)
+-- "...\\steamapps\\common\\Hades II\\Ship\\Hades2.exe" -> "Hades II" (offline, exact).
+local function steam_folder_name(exe_path)
+    if not exe_path then return nil end
+    local name = exe_path:gsub("/", "\\"):match("[Ss][Tt][Ee][Aa][Mm][Aa][Pp][Pp][Ss]\\[Cc][Oo][Mm][Mm][Oo][Nn]\\([^\\]+)\\")
+    return name
+end
+
+local function friendly_name(raw_exe_name, window_title, is_fullscreen, exe_path)
     local lower = raw_exe_name:lower()
 
     local mapped = name_map[lower]
@@ -4055,7 +4366,7 @@ local function friendly_name(raw_exe_name, window_title, is_fullscreen)
     if has_title then
         -- Sanitize now (not just later in on_replay_saved) so the name we
         -- remember is the EXACT string that will become the folder name.
-        local name = sanitize(extract_stable_app_name(window_title))
+        local name = sanitize(extract_stable_app_name(window_title, is_fullscreen))
         -- Lock this exe -> name for the rest of this OBS session, so a
         -- title that isn't perfectly identical every time (loading screen,
         -- stray invisible character, ...) doesn't fan out into several
@@ -4066,6 +4377,13 @@ local function friendly_name(raw_exe_name, window_title, is_fullscreen)
             title_name_cache[lower] = name
         end
         return name
+    end
+
+    -- No window title: the Steam install folder names the game exactly, offline.
+    local folder_name = steam_folder_name(exe_path)
+    if folder_name then
+        title_name_cache[lower] = sanitize(folder_name)
+        return title_name_cache[lower]
     end
 
     local steam_name = steam_lookup_name(raw_exe_name)
@@ -4085,7 +4403,7 @@ local function ensure_folder(win_folder)
     local ok = kernel32.CreateDirectoryW(wide_folder, nil)
     if ok == 0 then
         local err = kernel32.GetLastError()
-        if err ~= ERROR_ALREADY_EXISTS then
+        if err ~= C.ERROR_ALREADY_EXISTS then
             print("OBS Replay Organizer: CreateDirectoryW failed for '" .. win_folder ..
                   "' (error " .. tostring(err) .. ").")
         end
@@ -4096,7 +4414,7 @@ end
 local function file_exists(win_path)
     local wide = utf8_to_wide(win_path)
     local attrs = kernel32.GetFileAttributesW(wide)
-    return tonumber(attrs) ~= INVALID_FILE_ATTRIBUTES
+    return tonumber(attrs) ~= C.INVALID_FILE_ATTRIBUTES
 end
 
 -- Builds a destination path that doesn't collide with an existing file --
@@ -4127,7 +4445,7 @@ local function log_move_failure(win_src, win_dest, attempts, err)
 end
 
 local function is_lock_error(err)
-    return err == ERROR_SHARING_VIOLATION or err == ERROR_LOCK_VIOLATION
+    return err == C.ERROR_SHARING_VIOLATION or err == C.ERROR_LOCK_VIOLATION
 end
 
 -- Moves src into dest_folder under a unique name. Returns:
@@ -4168,14 +4486,14 @@ local function move_file(src, dest_folder, new_base_name, on_moved_later)
     local win_dest = unique_dest_path(win_dest_folder, base_no_ext, ext)
 
     -- Direct Win32 move (no cmd.exe / "move" process, no shell spawn at all).
-    -- MOVEFILE_COPY_ALLOWED mirrors the old fallback behavior for moves
-    -- across drives. No MOVEFILE_REPLACE_EXISTING -- win_dest is guaranteed
+    -- C.MOVEFILE_COPY_ALLOWED mirrors the old fallback behavior for moves
+    -- across drives. No C.MOVEFILE_REPLACE_EXISTING -- win_dest is guaranteed
     -- unique by unique_dest_path() above, so this never needs to (and
     -- never should) silently overwrite an existing clip.
     local wide_src = utf8_to_wide(win_src)
     local wide_dest = utf8_to_wide(win_dest)
 
-    if kernel32.MoveFileExW(wide_src, wide_dest, MOVEFILE_COPY_ALLOWED) ~= 0 then
+    if kernel32.MoveFileExW(wide_src, wide_dest, C.MOVEFILE_COPY_ALLOWED) ~= 0 then
         return win_dest
     end
     local err = kernel32.GetLastError()
@@ -4193,21 +4511,21 @@ local function move_file(src, dest_folder, new_base_name, on_moved_later)
     local retry
     retry = function()
         attempt = attempt + 1
-        if kernel32.MoveFileExW(wide_src, wide_dest, MOVEFILE_COPY_ALLOWED) ~= 0 then
+        if kernel32.MoveFileExW(wide_src, wide_dest, C.MOVEFILE_COPY_ALLOWED) ~= 0 then
             obs.timer_remove(retry)
             pending_move_timers[retry] = nil
             on_moved_later(win_dest)
             return
         end
         local retry_err = kernel32.GetLastError()
-        if not is_lock_error(retry_err) or attempt >= MOVE_RETRY_ATTEMPTS then
+        if not is_lock_error(retry_err) or attempt >= C.MOVE_RETRY_ATTEMPTS then
             obs.timer_remove(retry)
             pending_move_timers[retry] = nil
             log_move_failure(win_src, win_dest, attempt, retry_err)
         end
     end
     pending_move_timers[retry] = true
-    obs.timer_add(retry, MOVE_RETRY_DELAY_MS)
+    obs.timer_add(retry, C.MOVE_RETRY_DELAY_MS)
     return nil, true
 end
 
@@ -4254,12 +4572,13 @@ end
         -- Exe unreadable (anti-cheat/protected) but the window is fullscreen
         -- and titled: treat as a game, named from the title.
         is_game = true
-        game = extract_stable_app_name(info.window_title)
+        game = extract_stable_app_name(info.window_title, true)
     else
         local exe_lower = info.exe_name:lower()
-        if NON_GAME_EXES[exe_lower] then
+        if NON_GAME_EXES[exe_lower] and not name_map[exe_lower] then
             -- Browsers, Explorer, Discord, OBS itself...: never a game, even
-            -- if a stray entry for them exists in known_games.txt.
+            -- if a stray entry for them exists in known_games.txt -- unless YOU
+            -- named it with the "Add" button (name_map), which always wins.
             is_game = false
         elseif name_map[exe_lower] or KNOWN_GAMES[exe_lower] then
             -- A game you (or the built-in list) named is a game even windowed.
@@ -4277,7 +4596,7 @@ end
         end
         -- The name (and any Steam lookup) is resolved ONLY for games.
         if is_game then
-            game = friendly_name(info.exe_name, info.window_title, info.is_fullscreen)
+            game = friendly_name(info.exe_name, info.window_title, info.is_fullscreen, info.exe_path)
         end
     end
     game = sanitize(game)
@@ -4419,9 +4738,11 @@ do
     -- build this script might run on, so it's called through pcall and
     -- treated as "not active" if the call itself fails, rather than
     -- blocking every auto-install forever on an API that isn't there.
+    -- The Replay Buffer is deliberately NOT counted: install_pending() stops it
+    -- and the new OBS starts it again, so it must not block an update (it is
+    -- running almost all the time, which used to hold "auto" mode back forever).
     local function outputs_are_active()
-        if obs.obs_frontend_streaming_active() or obs.obs_frontend_recording_active()
-            or obs.obs_frontend_replay_buffer_active() then
+        if obs.obs_frontend_streaming_active() or obs.obs_frontend_recording_active() then
             return true
         end
         local ok, active = pcall(obs.obs_frontend_virtualcam_active)
@@ -4548,8 +4869,8 @@ do
         return true
     end
 
-    local MOVEFILE_REPLACE_EXISTING = 0x1
-    local MOVEFILE_WRITE_THROUGH    = 0x8
+    C.MOVEFILE_REPLACE_EXISTING = 0x1
+    C.MOVEFILE_WRITE_THROUGH    = 0x8
 
     -- Installs new script content over the local file ATOMICALLY: the new
     -- content is first written in full to "<script>.new", read back and
@@ -4602,10 +4923,24 @@ do
                 return false, "couldn't write a backup of your current script, so nothing was changed"
             end
             W.write_file(path .. ".bak", old_content)
+
+            -- Keep only the 3 newest per-version backups (the list lives in the
+            -- script's saved settings) so they don't pile up forever.
+            if updater_settings ~= nil then
+                local items = {}
+                for p in obs.obs_data_get_string(updater_settings, "backup_list"):gmatch("[^\n]+") do
+                    if p ~= backup_path then items[#items + 1] = p end
+                end
+                items[#items + 1] = backup_path
+                while #items > 3 do
+                    W.remove(table.remove(items, 1))
+                end
+                obs.obs_data_set_string(updater_settings, "backup_list", table.concat(items, "\n"))
+            end
         end
 
         local moved = kernel32.MoveFileExW(utf8_to_wide(tmp_path), utf8_to_wide(path),
-            MOVEFILE_REPLACE_EXISTING + MOVEFILE_WRITE_THROUGH)
+            C.MOVEFILE_REPLACE_EXISTING + C.MOVEFILE_WRITE_THROUGH)
         if moved == 0 then
             local err = kernel32.GetLastError()
             W.remove(tmp_path)
@@ -4640,9 +4975,9 @@ do
         end
     end
 
-    local SW_SHOWNORMAL = 1
-    local WM_CLOSE = 0x0010
-    local GW_OWNER = 4
+    C.SW_SHOWNORMAL = 1
+    C.WM_CLOSE = 0x0010
+    C.GW_OWNER = 4
 
     -- Finds OBS's own MAIN window. It can't just take the first visible
     -- window of this process: the Scripts window, dialogs and floating
@@ -4657,7 +4992,7 @@ do
         local own_pid = kernel32.GetCurrentProcessId()
         local found = nil
         local cb = ffi.cast("WNDENUMPROC", function(hwnd, _lparam)
-            if user32.IsWindowVisible(hwnd) ~= 0 and user32.GetWindow(hwnd, GW_OWNER) == nil then
+            if user32.IsWindowVisible(hwnd) ~= 0 and user32.GetWindow(hwnd, C.GW_OWNER) == nil then
                 local pid = ffi.new("DWORD[1]")
                 user32.GetWindowThreadProcessId(hwnd, pid)
                 if pid[0] == own_pid then
@@ -4767,12 +5102,12 @@ do
                 wargs = built
             end
 
-            local result = shell32.ShellExecuteW(nil, nil, wbuf, wargs, wdir, SW_SHOWNORMAL)
+            local result = shell32.ShellExecuteW(nil, nil, wbuf, wargs, wdir, C.SW_SHOWNORMAL)
             if tonumber(ffi.cast("intptr_t", result)) <= 32 then
                 error("ShellExecuteW couldn't start a new OBS instance")
             end
 
-            user32.PostMessageW(main_hwnd, WM_CLOSE, 0, 0)
+            user32.PostMessageW(main_hwnd, C.WM_CLOSE, 0, 0)
         end)
         if not ok then
             if marker_written then
@@ -4882,6 +5217,12 @@ do
                     if not ok2 then
                         last_check_result = "Couldn't install the update automatically (" .. tostring(err2) ..
                             "). Get it here: " .. RELEASES_URL
+                        -- Same fallback as the no-buffer path: keep the download somewhere writable.
+                        local fb = fallback_update_path()
+                        if fb and W.write_file(fb, content) then
+                            last_check_result = last_check_result .. " The new version was also saved to " .. fb ..
+                                " -- copy it over the old file yourself."
+                        end
                         obs.script_log(obs.LOG_WARNING, "OBS Clip Suite: " .. last_check_result)
                     end
                 elseif tries >= 30 then
@@ -5173,7 +5514,7 @@ do
             -- but that consent covers installing unattended, not
             -- cutting off a live stream/recording/Replay Buffer or
             -- yanking a fullscreen game to the desktop. relaunch_obs()
-            -- posts WM_CLOSE, and if outputs are active OBS's own
+            -- posts C.WM_CLOSE, and if outputs are active OBS's own
             -- shutdown path pops its "Active Outputs" confirmation --
             -- a modal dialog nobody is there to answer during an
             -- unattended auto-install. So: hold off and retry later
@@ -5182,7 +5523,7 @@ do
             auto_install_attempts = 0
             if outputs_are_active() or Sorter.foreground_is_fullscreen() then
                 last_check_result = "An update is staged but is being held back because a " ..
-                    "stream/recording/Replay Buffer is active (or a game is fullscreen) -- " ..
+                    "stream/recording is active (or a game is fullscreen) -- " ..
                     "it'll install automatically once that's no longer the case."
                 obs.script_log(obs.LOG_INFO, "OBS Clip Suite: " .. last_check_result)
                 obs.timer_remove(retry_auto_install)
@@ -5313,6 +5654,7 @@ do
         obs.obs_data_set_default_string(settings, "update_mode", "ask")
         obs.obs_data_set_default_string(settings, "skipped_update_version", "")
         obs.obs_data_set_default_string(settings, "last_backup_path", "")
+        obs.obs_data_set_default_string(settings, "backup_list", "")
     end
 
     function Updater.script_update(settings)
@@ -5426,7 +5768,7 @@ local function process_is_running(pid)
     if h == nil then
         -- Access denied (5) means it exists but belongs to a higher-privilege
         -- process (e.g. OBS run as admin): still running. Anything else: gone.
-        return ffi.errno() == 5
+        return kernel32.GetLastError() == 5
     end
     local r = kernel32.WaitForSingleObject(h, 0)
     kernel32.CloseHandle(h)

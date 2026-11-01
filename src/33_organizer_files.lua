@@ -7,7 +7,7 @@ local function ensure_folder(win_folder)
     local ok = kernel32.CreateDirectoryW(wide_folder, nil)
     if ok == 0 then
         local err = kernel32.GetLastError()
-        if err ~= ERROR_ALREADY_EXISTS then
+        if err ~= C.ERROR_ALREADY_EXISTS then
             print("OBS Replay Organizer: CreateDirectoryW failed for '" .. win_folder ..
                   "' (error " .. tostring(err) .. ").")
         end
@@ -18,7 +18,7 @@ end
 local function file_exists(win_path)
     local wide = utf8_to_wide(win_path)
     local attrs = kernel32.GetFileAttributesW(wide)
-    return tonumber(attrs) ~= INVALID_FILE_ATTRIBUTES
+    return tonumber(attrs) ~= C.INVALID_FILE_ATTRIBUTES
 end
 
 -- Builds a destination path that doesn't collide with an existing file --
@@ -49,7 +49,7 @@ local function log_move_failure(win_src, win_dest, attempts, err)
 end
 
 local function is_lock_error(err)
-    return err == ERROR_SHARING_VIOLATION or err == ERROR_LOCK_VIOLATION
+    return err == C.ERROR_SHARING_VIOLATION or err == C.ERROR_LOCK_VIOLATION
 end
 
 -- Moves src into dest_folder under a unique name. Returns:
@@ -90,14 +90,14 @@ local function move_file(src, dest_folder, new_base_name, on_moved_later)
     local win_dest = unique_dest_path(win_dest_folder, base_no_ext, ext)
 
     -- Direct Win32 move (no cmd.exe / "move" process, no shell spawn at all).
-    -- MOVEFILE_COPY_ALLOWED mirrors the old fallback behavior for moves
-    -- across drives. No MOVEFILE_REPLACE_EXISTING -- win_dest is guaranteed
+    -- C.MOVEFILE_COPY_ALLOWED mirrors the old fallback behavior for moves
+    -- across drives. No C.MOVEFILE_REPLACE_EXISTING -- win_dest is guaranteed
     -- unique by unique_dest_path() above, so this never needs to (and
     -- never should) silently overwrite an existing clip.
     local wide_src = utf8_to_wide(win_src)
     local wide_dest = utf8_to_wide(win_dest)
 
-    if kernel32.MoveFileExW(wide_src, wide_dest, MOVEFILE_COPY_ALLOWED) ~= 0 then
+    if kernel32.MoveFileExW(wide_src, wide_dest, C.MOVEFILE_COPY_ALLOWED) ~= 0 then
         return win_dest
     end
     local err = kernel32.GetLastError()
@@ -115,21 +115,21 @@ local function move_file(src, dest_folder, new_base_name, on_moved_later)
     local retry
     retry = function()
         attempt = attempt + 1
-        if kernel32.MoveFileExW(wide_src, wide_dest, MOVEFILE_COPY_ALLOWED) ~= 0 then
+        if kernel32.MoveFileExW(wide_src, wide_dest, C.MOVEFILE_COPY_ALLOWED) ~= 0 then
             obs.timer_remove(retry)
             pending_move_timers[retry] = nil
             on_moved_later(win_dest)
             return
         end
         local retry_err = kernel32.GetLastError()
-        if not is_lock_error(retry_err) or attempt >= MOVE_RETRY_ATTEMPTS then
+        if not is_lock_error(retry_err) or attempt >= C.MOVE_RETRY_ATTEMPTS then
             obs.timer_remove(retry)
             pending_move_timers[retry] = nil
             log_move_failure(win_src, win_dest, attempt, retry_err)
         end
     end
     pending_move_timers[retry] = true
-    obs.timer_add(retry, MOVE_RETRY_DELAY_MS)
+    obs.timer_add(retry, C.MOVE_RETRY_DELAY_MS)
     return nil, true
 end
 
@@ -176,12 +176,13 @@ end
         -- Exe unreadable (anti-cheat/protected) but the window is fullscreen
         -- and titled: treat as a game, named from the title.
         is_game = true
-        game = extract_stable_app_name(info.window_title)
+        game = extract_stable_app_name(info.window_title, true)
     else
         local exe_lower = info.exe_name:lower()
-        if NON_GAME_EXES[exe_lower] then
+        if NON_GAME_EXES[exe_lower] and not name_map[exe_lower] then
             -- Browsers, Explorer, Discord, OBS itself...: never a game, even
-            -- if a stray entry for them exists in known_games.txt.
+            -- if a stray entry for them exists in known_games.txt -- unless YOU
+            -- named it with the "Add" button (name_map), which always wins.
             is_game = false
         elseif name_map[exe_lower] or KNOWN_GAMES[exe_lower] then
             -- A game you (or the built-in list) named is a game even windowed.
@@ -199,7 +200,7 @@ end
         end
         -- The name (and any Steam lookup) is resolved ONLY for games.
         if is_game then
-            game = friendly_name(info.exe_name, info.window_title, info.is_fullscreen)
+            game = friendly_name(info.exe_name, info.window_title, info.is_fullscreen, info.exe_path)
         end
     end
     game = sanitize(game)

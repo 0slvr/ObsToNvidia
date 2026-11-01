@@ -88,9 +88,11 @@ do
     -- build this script might run on, so it's called through pcall and
     -- treated as "not active" if the call itself fails, rather than
     -- blocking every auto-install forever on an API that isn't there.
+    -- The Replay Buffer is deliberately NOT counted: install_pending() stops it
+    -- and the new OBS starts it again, so it must not block an update (it is
+    -- running almost all the time, which used to hold "auto" mode back forever).
     local function outputs_are_active()
-        if obs.obs_frontend_streaming_active() or obs.obs_frontend_recording_active()
-            or obs.obs_frontend_replay_buffer_active() then
+        if obs.obs_frontend_streaming_active() or obs.obs_frontend_recording_active() then
             return true
         end
         local ok, active = pcall(obs.obs_frontend_virtualcam_active)
@@ -217,8 +219,8 @@ do
         return true
     end
 
-    local MOVEFILE_REPLACE_EXISTING = 0x1
-    local MOVEFILE_WRITE_THROUGH    = 0x8
+    C.MOVEFILE_REPLACE_EXISTING = 0x1
+    C.MOVEFILE_WRITE_THROUGH    = 0x8
 
     -- Installs new script content over the local file ATOMICALLY: the new
     -- content is first written in full to "<script>.new", read back and
@@ -271,10 +273,24 @@ do
                 return false, "couldn't write a backup of your current script, so nothing was changed"
             end
             W.write_file(path .. ".bak", old_content)
+
+            -- Keep only the 3 newest per-version backups (the list lives in the
+            -- script's saved settings) so they don't pile up forever.
+            if updater_settings ~= nil then
+                local items = {}
+                for p in obs.obs_data_get_string(updater_settings, "backup_list"):gmatch("[^\n]+") do
+                    if p ~= backup_path then items[#items + 1] = p end
+                end
+                items[#items + 1] = backup_path
+                while #items > 3 do
+                    W.remove(table.remove(items, 1))
+                end
+                obs.obs_data_set_string(updater_settings, "backup_list", table.concat(items, "\n"))
+            end
         end
 
         local moved = kernel32.MoveFileExW(utf8_to_wide(tmp_path), utf8_to_wide(path),
-            MOVEFILE_REPLACE_EXISTING + MOVEFILE_WRITE_THROUGH)
+            C.MOVEFILE_REPLACE_EXISTING + C.MOVEFILE_WRITE_THROUGH)
         if moved == 0 then
             local err = kernel32.GetLastError()
             W.remove(tmp_path)

@@ -73,7 +73,7 @@ local function process_is_running(pid)
     if h == nil then
         -- Access denied (5) means it exists but belongs to a higher-privilege
         -- process (e.g. OBS run as admin): still running. Anything else: gone.
-        return ffi.errno() == 5
+        return kernel32.GetLastError() == 5
     end
     local r = kernel32.WaitForSingleObject(h, 0)
     kernel32.CloseHandle(h)
