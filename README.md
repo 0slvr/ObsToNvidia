@@ -1,115 +1,94 @@
 # OBS Clip Suite
 
-One OBS Studio script that makes OBS's normal Replay Buffer work like **NVIDIA instant replay (ShadowPlay)** on Windows:
+One OBS Studio Lua script that makes **Replay Buffer clipping** painless on Windows:
 
-- every clip is **separate**, with no overlapping footage,
-- clips are **sorted into a folder per game**,
-- and you get a **sound** when a clip is saved.
-
-| | Module | What it does |
-|---|---|---|
-| 1 | **Replay Buffer Restarter** | Restarts the buffer after every save, so back-to-back clips never overlap. |
-| 2 | **Replay Organizer** | Sorts each clip into a folder named after the game you were playing. |
-| 3 | **Clip Alert Sound** | Plays a short sound whenever a clip is saved. |
-| 4 | **Update Checker** | Updates the script for you from this repo's Releases. |
+1. **Replay Buffer Restarter** – restarts the buffer right after every save, so back-to-back clips never share overlapping footage.
+2. **Replay Organizer** – sorts each saved clip into a per-game / per-app folder automatically.
+3. **Clip Alert Sound** – plays a short sound every time a clip is saved.
+4. **Update Checker** – checks this repo's Releases and updates the script for you.
 
 Everything lives in a single file: `obs_to_nvidia.lua`.
 
 ---
 
-## Quick start
+## Requirements
 
-**You need:** Windows, OBS Studio, and the Replay Buffer enabled (`Settings > Output > Replay Buffer`) with a save hotkey.
+- **Windows** (the Organizer and the updater use Win32 calls; without them the Restarter and Alert modules still work, the Organizer disables itself).
+- **OBS Studio** with Lua scripting (the stock Windows build; developed on OBS 33).
+- The **Replay Buffer** enabled in OBS (`Settings > Output > Replay Buffer`) and a save hotkey set.
+
+## Install
 
 1. Download `obs_to_nvidia.lua` from the [latest Release](../../releases/latest).
-2. Put it somewhere permanent (not Downloads: OBS remembers the path).
+2. Put it somewhere permanent (OBS remembers the path; don't leave it in Downloads).
 3. In OBS: **Tools > Scripts > `+`** and pick the file.
 
 ![OBS Tools menu with the Scripts entry highlighted](images/tools-scripts-menu.png)
 
-Each module has its own group with an on/off checkbox in its header.
+That's it. Each module has its own group in the Scripts window with an on/off checkbox in the group header.
 
-![The Scripts window showing the four groups](images/scripts-window.png)
+![The Scripts window showing the four groups: Replay Buffer Restarter, Replay Organizer, Clip Alert Sound, Update Checker](images/scripts-window.png)
 
-> Without Windows features, the Restarter and Alert Sound still work; the Organizer and updater switch themselves off.
+## What each module does
 
----
+On every `Replay Buffer Saved` event the modules run in this order:
 
-<<<<<<< HEAD
-## How it works
-=======
 1. The Alert plays its sound (first, so it is never delayed by the Organizer). It only plays for a real save: the `Saved` event plus the clip file being on disk.
 2. The Organizer moves the clip into its folder.
 3. The Restarter stops and restarts the Replay Buffer.
->>>>>>> fd041e9 (Release v2.20)
 
-When a clip is saved, the modules run in this order: **Organizer → Alert Sound → Restarter**.
 An error in one module never stops the others.
 
 ### 1) Replay Buffer Restarter
-Nothing to configure.
 
-- Waits for all saves in progress to finish before restarting.
-- Handles quick bursts of saves and learns how long the buffer takes to start on your PC.
-- If the buffer doesn't come back, it retries in the background (up to 12 times) and logs a warning instead of staying silently off.
-- If you stop the buffer yourself, it stays stopped.
-- After 3 restart cycles in a row that needed recovery, it pauses for the session. Untick and tick its checkbox to resume.
+After a save, the script asks OBS to stop the buffer, waits for OBS's "stopped" event, starts it **once**, and waits for the "started" event. A slow watchdog timer is only a safety net in case an event never arrives (it retries a few times, then logs a warning instead of looping forever).
 
 ### 2) Replay Organizer
-Sorts every clip into a folder named after the game or app.
 
-- Reads the real foreground window with direct Win32 calls, so **fullscreen games are never minimized or kicked to the desktop**.
-- Remembers the last few seconds, so a save right after you alt-tab still goes to the right game.
-- Non-game apps go to a shared **Desktop** folder.
-- Never overwrites a clip; works with non-ASCII (e.g. Arabic) names and paths.
+Sorts every saved clip into a subfolder named after the game or app you were actually playing.
 
-**Custom names:** type the current folder name, type the new name, press **Add**.
-
-**Where a game's name comes from** (first match wins):
-your own names → built-in list / `known_games.txt` → window title → Steam folder name → Steam lookup.
-
-- **Steam lookup** is optional (*Look up unknown games on Steam*). Results are saved in `known_games.txt`.
-- `known_games.txt` is in `%APPDATA%\obs-studio\script-data\OBS-Clip-Suite`. Reload the script after editing it.
+- Detects the **real foreground window** using direct Win32 calls only (no `cmd.exe` / PowerShell is spawned), so **fullscreen games are never minimized or kicked to the desktop**.
+- Keeps a short rolling history of the foreground app, so a save that fires a couple of seconds after you alt-tab still goes to the right game.
+- Non-game apps go into a shared **Desktop** folder.
+- Never overwrites an existing clip if two clips get the same name in the same second.
+- Handles non-ASCII (e.g. Arabic) folder names and paths.
+- **Custom names:** in the group, type the current folder name, type the new name, press **Add**. Your entries are saved with the script's settings.
+- **Known games list:** a built-in list is merged with your own entries in `known_games.txt` (in `%APPDATA%\obs-studio\script-data\OBS-Clip-Suite`). Reload the script after editing it.
+- **Game names:** your own names > built-in/known_games.txt > the game's window title > the Steam install folder name (offline) > Steam lookup.
+- **Steam lookup (optional):** only when a game has no window title and no Steam folder, unknown games can be looked up on the Steam Store by name. Results are remembered in `known_games.txt`. Turn it off with *Look up unknown games on Steam*.
 
 ### 3) Clip Alert Sound
-Off by default. Turn it on with the group's checkbox, then pick:
 
-- one of **6 built-in sounds** (no extra files), or your own file (`.wav .mp3 .ogg .aac .flac`)
-- the **volume** (0–100 %)
-- **Test Alert Now** to hear it
+Off by default. Turn it on with the group's checkbox, then choose:
+
+- one of **6 built-in sounds** (embedded in the script, no extra files),
+- or your own file (`.wav .mp3 .ogg .aac .flac`) under *Custom sound file*,
+- the **volume** (0–100 %),
+- and press **Test Alert Now** to hear it.
 
 ### 4) Update Checker
-Checks GitHub Releases about 10 seconds after OBS starts (can be turned off), or any time with **Check for Updates Now**. Only a *higher* version number is ever offered.
 
-**When an update is found**, choose what happens:
+- Checks GitHub Releases ~10 seconds after OBS starts (can be turned off), or any time with **Check for Updates Now**.
+- Updates are compared by **version number** (`1.10.0` is newer than `1.9.0`); only a *higher* version is offered.
+- **When an update is found**:
+  - *Ask me first* (default) – a dialog: Yes = install, No = skip this version, Cancel = ask again later.
+  - *Install it automatically* – installs when no stream / recording / virtual camera is active and no fullscreen game is in front (the Replay Buffer doesn't block it: it is stopped first and started again by the new OBS).
+  - *Only mention it in the log*.
+- The dialog and installs are held back while a fullscreen game is in the foreground. The dialog is also held back while a stream / recording / virtual camera is active, and only one dialog can be open at a time.
+- An update restarts OBS twice (it opens and closes twice): the second restart is what loads the new version. The Replay Buffer is resumed at the end.
+- **Restore previous version** puts the newer version on the skipped list, so it isn't offered again right after the restore.
+- Your old script is backed up next to it as `obs_to_nvidia.lua.bak` and `obs_to_nvidia.lua.bak-<version>`. **Restore previous version** brings it back.
+- **How an update is applied (2.4.2+):** the new file is written next to the script as `obs_to_nvidia.lua.staged`. OBS then starts a fresh instance, the old one closes, and the *new* instance swaps the file in and starts the Replay Buffer again – once. The running script file is never overwritten while OBS is using it.
 
-| Mode | Behaviour |
-|---|---|
-| **Ask me first** (default) | Dialog: *Yes* = install, *No* = skip this version, *Cancel* = ask again later. |
-| **Install it automatically** | Installs by itself. |
-| **Only mention it in the log** | Just a log message. |
-
-Nothing is installed or shown during a **stream, recording, Virtual Camera** or while a **fullscreen game** is in front. It waits until they're over. (The Replay Buffer doesn't block it.)
-
-**What to expect:**
-- OBS closes and opens **twice** during an update. This is normal: the second restart loads the new version.
-- The Replay Buffer is stopped first and resumes automatically at the end.
-- Your old script is backed up next to it as `obs_to_nvidia.lua.bak` and `.bak-<version>`.
-
-**Restore previous version** brings the old script back and restarts OBS automatically. The newer version is added to the skipped list so you aren't asked about it again right away.
-
----
-
-## Files created
+## Settings files created next to the script
 
 | File | Purpose |
-|---|---|
+| --- | --- |
 | `obs_to_nvidia.lua.bak`, `.bak-<version>` | Backups made by the updater |
-| `obs_to_nvidia.lua.staged`, `.new` | Temporary files during an update |
-| `obs_to_nvidia_update_state.tmp` | Temporary marker during an update |
-| `known_games.txt` | Your extra game names and cached Steam results |
+| `obs_to_nvidia.lua.staged` | Downloaded update waiting to be applied (temporary) |
+| `obs_to_nvidia_update_state.tmp` | Temporary marker used during a self-update |
+| `known_games.txt` (in `%APPDATA%\obs-studio\script-data\OBS-Clip-Suite`) | Your extra game names and cached Steam results |
 
 ## Troubleshooting
 
-**"No properties available" / `Error opening file: (null)` in the Script Log**
-OBS couldn't read the script. Check that `obs_to_nvidia.lua` exists at the path shown in Tools > Scripts, remove the entry, and add the file again.
+- **"No properties available" / `Error opening file: (null)` in the Script Log** – OBS couldn't read the script file. Check that `obs_to_nvidia.lua` exists at the path shown in Tools > Scripts, remove the entry, and add the file again.

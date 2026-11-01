@@ -267,6 +267,14 @@ do
             -- A save has begun (OBS 30.2+; on older versions this event doesn't
             -- exist and the module simply relies on the quiet period).
             local t = now()
+            if pending_saves > 0 and t - last_saving_at <= STALE_MS then
+                -- OBS writes one clip at a time and ignores save presses (key held,
+                -- double press) while one is being written -- yet still announces each
+                -- press with SAVING. Those never get a SAVED event, so counting them
+                -- left the restarter waiting for saves that never finish (and treating
+                -- every press as a new burst), i.e. no restart for ~25 s after a spam.
+                return
+            end
             if #save_times > 0 then
                 local followed = (t - save_times[#save_times]) < BURST_GAP_MS and 1 or 0
                 repeat_rate = repeat_rate * 0.8 + followed * 0.2
