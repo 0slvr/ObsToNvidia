@@ -17,9 +17,11 @@
 --     No     -> skip this version; remembered across restarts, and a later
 --               release is still offered normally
 --     Cancel -> decide later; asked again on the next check
--- The dialog is held back while a fullscreen game is in the foreground and
--- shown once you're out of it, since interrupting a fullscreen game is the
--- exact thing the rest of this script exists to avoid.
+-- The dialog is held back while a fullscreen game is in the foreground OR a
+-- stream / recording / virtual camera is active, and shown once those are
+-- over, since interrupting them is the exact thing the rest of this script
+-- exists to avoid. (The Replay Buffer does NOT hold it back: the installer
+-- stops it first and the new OBS starts it again.)
 --
 -- Either way, OBS keeps whatever version it already loaded into memory
 -- running until you reload this script or restart OBS -- there's no API
@@ -56,6 +58,11 @@ do
     local VERSION_PROBE_TIMEOUTS = { resolve = 1500, connect = 1500, send = 1500, receive = 2500,
         total = 4000, headers = "Range: bytes=0-4095\r\n" }
 
+    -- First version that understands the new restart protocol ("the new OBS waits
+    -- for the old one to exit before resuming the Replay Buffer"). Older versions
+    -- don't, so restoring one of those must NOT go through the relaunch path.
+    local WAIT_PROTOCOL_VERSION = "2.15"
+
     local check_on_load = true
     -- "ask" (default) shows a dialog and does nothing without an answer,
     -- "auto" installs silently, "notify" only writes to the log.
@@ -76,6 +83,8 @@ do
     -- Fields: path, content, version.
     local pending_update = nil
     local prompt_attempts = 0
+    -- (Updater.prompt_open, set while a dialog is on screen, lives in the
+    -- Updater table on purpose: the chunk is close to LuaJIT's 200-locals limit.)
     local MAX_PROMPT_ATTEMPTS = 40   -- ~20 minutes at PROMPT_RETRY_MS
     local PROMPT_RETRY_MS = 30000
     local auto_install_attempts = 0
@@ -266,27 +275,15 @@ do
         local backup_path = nil
         local old_content = W.read_file(path)
         if old_content then
-            local old_version = extract_version(old_content) or "unknown"
+            -- A script without a version number gets a unique name (timestamp),
+            -- so several unversioned backups can't overwrite each other.
+            local old_version = extract_version(old_content) or ("unknown-" .. tostring(os.time()))
             backup_path = path .. ".bak-" .. old_version
             if not W.write_file(backup_path, old_content) or W.read_file(backup_path) ~= old_content then
                 W.remove(tmp_path)
                 return false, "couldn't write a backup of your current script, so nothing was changed"
             end
             W.write_file(path .. ".bak", old_content)
-
-            -- Keep only the 3 newest per-version backups (the list lives in the
-            -- script's saved settings) so they don't pile up forever.
-            if updater_settings ~= nil then
-                local items = {}
-                for p in obs.obs_data_get_string(updater_settings, "backup_list"):gmatch("[^\n]+") do
-                    if p ~= backup_path then items[#items + 1] = p end
-                end
-                items[#items + 1] = backup_path
-                while #items > 3 do
-                    W.remove(table.remove(items, 1))
-                end
-                obs.obs_data_set_string(updater_settings, "backup_list", table.concat(items, "\n"))
-            end
         end
 
         local moved = kernel32.MoveFileExW(utf8_to_wide(tmp_path), utf8_to_wide(path),
@@ -296,6 +293,22 @@ do
             W.remove(tmp_path)
             return false, "couldn't replace the script file (Windows error " .. tostring(err) ..
                 ") -- your current script was not touched"
+        end
+
+        -- Only NOW, after the swap really worked, trim the old backups: keep the
+        -- 3 newest per-version copies (the list lives in the script's saved
+        -- settings). Deleting before the swap could lose the oldest good copy
+        -- for an update that then failed.
+        if backup_path ~= nil and updater_settings ~= nil then
+            local items = {}
+            for p in obs.obs_data_get_string(updater_settings, "backup_list"):gmatch("[^\n]+") do
+                if p ~= backup_path then items[#items + 1] = p end
+            end
+            items[#items + 1] = backup_path
+            while #items > 3 do
+                W.remove(table.remove(items, 1))
+            end
+            obs.obs_data_set_string(updater_settings, "backup_list", table.concat(items, "\n"))
         end
 
         return true, backup_path

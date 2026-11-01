@@ -7,7 +7,7 @@ GitHub Releases. Each module has its own group and on/off checkbox.
 --]]
 
 -- Bump on every GitHub Release (compared numerically: 1.10.0 > 1.9.0).
-local VERSION = "2.15"
+local VERSION = "2.16"
 
 obs = obslua
 
@@ -4666,9 +4666,11 @@ end
 --     No     -> skip this version; remembered across restarts, and a later
 --               release is still offered normally
 --     Cancel -> decide later; asked again on the next check
--- The dialog is held back while a fullscreen game is in the foreground and
--- shown once you're out of it, since interrupting a fullscreen game is the
--- exact thing the rest of this script exists to avoid.
+-- The dialog is held back while a fullscreen game is in the foreground OR a
+-- stream / recording / virtual camera is active, and shown once those are
+-- over, since interrupting them is the exact thing the rest of this script
+-- exists to avoid. (The Replay Buffer does NOT hold it back: the installer
+-- stops it first and the new OBS starts it again.)
 --
 -- Either way, OBS keeps whatever version it already loaded into memory
 -- running until you reload this script or restart OBS -- there's no API
@@ -4705,6 +4707,11 @@ do
     local VERSION_PROBE_TIMEOUTS = { resolve = 1500, connect = 1500, send = 1500, receive = 2500,
         total = 4000, headers = "Range: bytes=0-4095\r\n" }
 
+    -- First version that understands the new restart protocol ("the new OBS waits
+    -- for the old one to exit before resuming the Replay Buffer"). Older versions
+    -- don't, so restoring one of those must NOT go through the relaunch path.
+    local WAIT_PROTOCOL_VERSION = "2.15"
+
     local check_on_load = true
     -- "ask" (default) shows a dialog and does nothing without an answer,
     -- "auto" installs silently, "notify" only writes to the log.
@@ -4725,6 +4732,8 @@ do
     -- Fields: path, content, version.
     local pending_update = nil
     local prompt_attempts = 0
+    -- (Updater.prompt_open, set while a dialog is on screen, lives in the
+    -- Updater table on purpose: the chunk is close to LuaJIT's 200-locals limit.)
     local MAX_PROMPT_ATTEMPTS = 40   -- ~20 minutes at PROMPT_RETRY_MS
     local PROMPT_RETRY_MS = 30000
     local auto_install_attempts = 0
@@ -4915,27 +4924,15 @@ do
         local backup_path = nil
         local old_content = W.read_file(path)
         if old_content then
-            local old_version = extract_version(old_content) or "unknown"
+            -- A script without a version number gets a unique name (timestamp),
+            -- so several unversioned backups can't overwrite each other.
+            local old_version = extract_version(old_content) or ("unknown-" .. tostring(os.time()))
             backup_path = path .. ".bak-" .. old_version
             if not W.write_file(backup_path, old_content) or W.read_file(backup_path) ~= old_content then
                 W.remove(tmp_path)
                 return false, "couldn't write a backup of your current script, so nothing was changed"
             end
             W.write_file(path .. ".bak", old_content)
-
-            -- Keep only the 3 newest per-version backups (the list lives in the
-            -- script's saved settings) so they don't pile up forever.
-            if updater_settings ~= nil then
-                local items = {}
-                for p in obs.obs_data_get_string(updater_settings, "backup_list"):gmatch("[^\n]+") do
-                    if p ~= backup_path then items[#items + 1] = p end
-                end
-                items[#items + 1] = backup_path
-                while #items > 3 do
-                    W.remove(table.remove(items, 1))
-                end
-                obs.obs_data_set_string(updater_settings, "backup_list", table.concat(items, "\n"))
-            end
         end
 
         local moved = kernel32.MoveFileExW(utf8_to_wide(tmp_path), utf8_to_wide(path),
@@ -4945,6 +4942,22 @@ do
             W.remove(tmp_path)
             return false, "couldn't replace the script file (Windows error " .. tostring(err) ..
                 ") -- your current script was not touched"
+        end
+
+        -- Only NOW, after the swap really worked, trim the old backups: keep the
+        -- 3 newest per-version copies (the list lives in the script's saved
+        -- settings). Deleting before the swap could lose the oldest good copy
+        -- for an update that then failed.
+        if backup_path ~= nil and updater_settings ~= nil then
+            local items = {}
+            for p in obs.obs_data_get_string(updater_settings, "backup_list"):gmatch("[^\n]+") do
+                if p ~= backup_path then items[#items + 1] = p end
+            end
+            items[#items + 1] = backup_path
+            while #items > 3 do
+                W.remove(table.remove(items, 1))
+            end
+            obs.obs_data_set_string(updater_settings, "backup_list", table.concat(items, "\n"))
         end
 
         return true, backup_path
@@ -5086,14 +5099,41 @@ do
                     while i < n and cl[i] ~= 32 do i = i + 1 end
                 end
                 while i < n and cl[i] == 32 do i = i + 1 end
-                local rest = n - i
-                local extra = " --multi"
-                local buf = ffi.new("WCHAR[?]", rest + #extra + 1)
-                if rest > 0 then
-                    ffi.copy(buf, cl + i, rest * ffi.sizeof("WCHAR"))
+                -- Copy the inherited arguments, DROPPING any "--multi" token they
+                -- already contain (left by an earlier update), so the command line
+                -- doesn't grow by one more "--multi" on every update.
+                local tmp = {}
+                local tlen = 0
+                local flag = "--multi"
+                local k = i
+                while k < n do
+                    local token_start = (k == i) or cl[k - 1] == 32
+                    local is_flag = false
+                    if token_start then
+                        is_flag = true
+                        for j = 1, #flag do
+                            if cl[k + j - 1] ~= flag:byte(j) then is_flag = false break end
+                        end
+                        if is_flag then
+                            local after = k + #flag
+                            if after < n and cl[after] ~= 32 then is_flag = false end
+                        end
+                    end
+                    if is_flag then
+                        k = k + #flag
+                    else
+                        tlen = tlen + 1
+                        tmp[tlen] = cl[k]
+                        k = k + 1
+                    end
                 end
-                for k = 1, #extra do
-                    buf[rest + k - 1] = extra:byte(k)
+                local extra = " --multi"
+                local buf = ffi.new("WCHAR[?]", tlen + #extra + 1)
+                for t = 1, tlen do
+                    buf[t - 1] = tmp[t]
+                end
+                for e = 1, #extra do
+                    buf[tlen + e - 1] = extra:byte(e)
                 end
                 return buf
             end)
@@ -5196,6 +5236,40 @@ do
     end
 
     local install_waiter = nil
+    local late_resume_timer = nil
+
+    -- The Replay Buffer was stopped for an update that then did NOT happen (it was
+    -- too slow to stop). If it finishes stopping afterwards, nobody would start it
+    -- again -- so watch for that and start it, for up to ~60 seconds.
+    local function resume_buffer_when_stopped()
+        if late_resume_timer ~= nil then
+            obs.timer_remove(late_resume_timer)
+        end
+        local tries = 0
+        local t
+        t = function()
+            tries = tries + 1
+            if obs.obs_frontend_replay_buffer_active() then
+                if tries >= 60 then
+                    obs.timer_remove(t)
+                    late_resume_timer = nil
+                end
+                return -- still active / still stopping: keep waiting
+            end
+            obs.timer_remove(t)
+            late_resume_timer = nil
+            obs.obs_frontend_replay_buffer_start()
+            obs.script_log(obs.LOG_INFO, "OBS Clip Suite: Replay Buffer started again after the cancelled update.")
+        end
+        late_resume_timer = t
+        obs.timer_add(t, 1000)
+    end
+    function Updater.cancel_late_resume()
+        if late_resume_timer ~= nil then
+            obs.timer_remove(late_resume_timer)
+            late_resume_timer = nil
+        end
+    end
 
     local function install_pending()
         local path, content = pending_update.path, pending_update.content
@@ -5224,12 +5298,14 @@ do
                         end
                         obs.script_log(obs.LOG_WARNING, "OBS Clip Suite: " .. last_check_result)
                     end
-                elseif tries >= 30 then
+                elseif tries >= 50 then -- ~10 seconds
                     obs.timer_remove(waiter)
                     install_waiter = nil
                     last_check_result = "The Replay Buffer wouldn't stop in time, so the update was NOT installed. " ..
                         "It will be offered again next time."
                     obs.script_log(obs.LOG_WARNING, "OBS Clip Suite: " .. last_check_result)
+                    -- It may still finish stopping a moment later: make sure it comes back.
+                    resume_buffer_when_stopped()
                 end
             end
             install_waiter = waiter
@@ -5274,7 +5350,15 @@ do
         -- the worst possible moment. "force" is set only for the manual
         -- "Check for Updates Now" button, where the user is demonstrably
         -- sitting in the Scripts window.
-        if not force and Sorter.foreground_is_fullscreen() then
+        -- Same for a live stream / recording / virtual camera: "Yes" would cut
+        -- them off, so the dialog waits until they are over.
+        if not force and (Sorter.foreground_is_fullscreen() or outputs_are_active()) then
+            return false
+        end
+
+        -- A dialog is already on screen (the modal one can let timers run):
+        -- never open a second one on top of it.
+        if Updater.prompt_open then
             return false
         end
 
@@ -5292,7 +5376,19 @@ do
             "stream or recording will be cut off -- finish or save\n" ..
             "anything important first."
 
-        local answer = Sorter.ask_yes_no_cancel(message, "OBS Clip Suite - update available")
+        Updater.prompt_open = true
+        local ask_ok, answer = pcall(Sorter.ask_yes_no_cancel, message, "OBS Clip Suite - update available")
+        Updater.prompt_open = false
+        if not ask_ok then
+            last_check_result = "Couldn't show the update dialog (" .. tostring(answer) .. ") -- nothing was changed."
+            obs.script_log(obs.LOG_WARNING, "OBS Clip Suite: " .. last_check_result)
+            pending_update = nil
+            return true
+        end
+        -- The timer-driven path may have cleared the update while the dialog was open.
+        if pending_update == nil then
+            return true
+        end
 
         if answer == nil then
             -- No dialog could be shown (non-Windows OBS, FFI unavailable).
@@ -5322,7 +5418,8 @@ do
         return true
     end
 
-    -- Retries a prompt that was held back because a game was fullscreen.
+    -- Retries a prompt that was held back because a game was fullscreen or a
+    -- stream / recording was active.
     -- Gives up after MAX_PROMPT_ATTEMPTS so a machine left in a game
     -- overnight doesn't keep a timer alive forever; the update is simply
     -- offered again on the next check.
@@ -5335,8 +5432,8 @@ do
         if prompt_attempts > MAX_PROMPT_ATTEMPTS then
             obs.timer_remove(retry_prompt)
             pending_update = nil
-            last_check_result = "An update is available but you stayed in a fullscreen app -- " ..
-                "it'll be offered again next time."
+            last_check_result = "An update is available but a fullscreen app or a stream/recording " ..
+                "stayed active -- it'll be offered again next time."
             return
         end
         if offer_pending_update(false) then
@@ -5377,6 +5474,9 @@ do
     -- newer version is actually found, so a normal OBS launch with no
     -- update doesn't spam the log every time).
     function Updater.check_for_updates(manual)
+        if Updater.prompt_open then
+            return -- an update/restore dialog is already on screen
+        end
         local own_path, local_content = read_own_script()
         if not local_content then
             last_check_result = "Couldn't read this script's own file from disk -- skipped."
@@ -5511,8 +5611,10 @@ do
         if update_mode == "auto" then
             -- Explicitly opted into installing without being asked --
             -- but that consent covers installing unattended, not
-            -- cutting off a live stream/recording/Replay Buffer or
-            -- yanking a fullscreen game to the desktop. relaunch_obs()
+            -- cutting off a live stream / recording / virtual camera or
+            -- yanking a fullscreen game to the desktop. (The Replay
+            -- Buffer does not hold it back: the installer stops it and
+            -- the new OBS starts it again.) relaunch_obs()
             -- posts C.WM_CLOSE, and if outputs are active OBS's own
             -- shutdown path pops its "Active Outputs" confirmation --
             -- a modal dialog nobody is there to answer during an
@@ -5540,7 +5642,7 @@ do
         prompt_attempts = 0
         if not offer_pending_update(manual) then
             last_check_result = "Version " .. remote_version .. " is available -- you'll be asked as " ..
-                "soon as you're out of fullscreen."
+                "soon as you're out of fullscreen and no stream/recording is running."
             obs.script_log(obs.LOG_INFO, "OBS Clip Suite: " .. last_check_result)
             obs.timer_remove(retry_prompt)
             obs.timer_add(retry_prompt, PROMPT_RETRY_MS)
@@ -5578,14 +5680,58 @@ do
             return
         end
         local backup_version = extract_version(backup_content) or "previous"
-        local answer = Sorter.ask_yes_no_cancel(
-            "Restore OBS Clip Suite version " .. backup_version .. " (you are on " .. VERSION .. ")?\n\n" ..
-            "Yes  -  Restore it and restart OBS now (the Replay Buffer is stopped and resumed)\n" ..
-            "No / Cancel  -  Do nothing",
-            "OBS Clip Suite - restore previous version")
-        if answer ~= Sorter.MB_IDYES then
+        -- Restoring to something OLDER than WAIT_PROTOCOL_VERSION: that version
+        -- doesn't know the "wait for the old OBS to exit" restart, so a relaunch
+        -- would make two OBS instances fight over the Replay Buffer. For those,
+        -- the file is swapped in place and OBS reloads the script by itself.
+        local old_protocol = backup_version ~= "previous"
+            and compare_versions(backup_version, WAIT_PROTOCOL_VERSION) < 0
+        local message
+        if old_protocol then
+            message = "Restore OBS Clip Suite version " .. backup_version .. " (you are on " .. VERSION .. ")?\n\n" ..
+                "This is an older version, so OBS is NOT restarted: the file is\n" ..
+                "replaced and the script reloads by itself (restart OBS yourself\n" ..
+                "if it doesn't).\n\n" ..
+                "Yes  -  Restore it\n" ..
+                "No / Cancel  -  Do nothing"
+        else
+            message = "Restore OBS Clip Suite version " .. backup_version .. " (you are on " .. VERSION .. ")?\n\n" ..
+                "Yes  -  Restore it and restart OBS now (the Replay Buffer is stopped and resumed)\n" ..
+                "No / Cancel  -  Do nothing"
+        end
+        if Updater.prompt_open then
             return
         end
+        Updater.prompt_open = true
+        local ask_ok, answer = pcall(Sorter.ask_yes_no_cancel, message, "OBS Clip Suite - restore previous version")
+        Updater.prompt_open = false
+        if not ask_ok or answer ~= Sorter.MB_IDYES then
+            return
+        end
+
+        -- Going back to an older version: the newer one is still on GitHub, so
+        -- the next check would offer it again within seconds. Put the version
+        -- we are leaving on the "skipped" list so that doesn't happen. (A still
+        -- newer release is offered normally; "Un-skip" undoes this.)
+        if compare_versions(VERSION, backup_version) > 0 then
+            remember_skipped(VERSION)
+        end
+
+        if old_protocol then
+            local ok, err = write_updated_script(own_path, backup_content)
+            if ok then
+                if err and updater_settings ~= nil then
+                    obs.obs_data_set_string(updater_settings, "last_backup_path", err)
+                end
+                last_check_result = "Restored version " .. backup_version .. " -- the script is reloading " ..
+                    "(restart OBS if it doesn't)."
+            else
+                last_check_result = "Couldn't restore the previous version (" .. tostring(err) .. ")."
+            end
+            obs.script_log(obs.LOG_WARNING, "OBS Clip Suite: " .. last_check_result)
+            return
+        end
+
         pending_update = { path = own_path, content = backup_content, version = backup_version }
         -- This writes the current file to its own .bak-<version> first, so
         -- restoring is itself reversible.
@@ -5667,7 +5813,21 @@ do
         end
     end
 
+    -- ".staged" / ".new" files left behind by an interrupted update. Only called
+    -- when no update is in progress (no marker), so nothing live is deleted.
+    function Updater.cleanup_leftovers()
+        local path = read_own_script()
+        if not path then return end
+        for _, suffix in ipairs({ ".staged", ".new" }) do
+            if W.exists(path .. suffix) then
+                W.remove(path .. suffix)
+                obs.script_log(obs.LOG_INFO, "OBS Clip Suite: removed a leftover " .. suffix .. " file from an interrupted update.")
+            end
+        end
+    end
+
     function Updater.script_load()
+        Updater.cleanup_leftovers()
         -- 10 seconds after load: the check can end in a modal dialog, and
         -- a few seconds in, OBS is often still bringing up its UI, loading
         -- the scene collection and starting outputs -- a topmost window
@@ -5683,6 +5843,8 @@ do
         -- keep firing against a dead module after a reload.
         obs.timer_remove(retry_prompt)
         obs.timer_remove(retry_auto_install)
+        Updater.cancel_late_resume()
+        Updater.prompt_open = false
         if install_waiter ~= nil then
             obs.timer_remove(install_waiter)
             install_waiter = nil

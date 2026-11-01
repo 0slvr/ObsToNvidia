@@ -134,14 +134,41 @@
                     while i < n and cl[i] ~= 32 do i = i + 1 end
                 end
                 while i < n and cl[i] == 32 do i = i + 1 end
-                local rest = n - i
-                local extra = " --multi"
-                local buf = ffi.new("WCHAR[?]", rest + #extra + 1)
-                if rest > 0 then
-                    ffi.copy(buf, cl + i, rest * ffi.sizeof("WCHAR"))
+                -- Copy the inherited arguments, DROPPING any "--multi" token they
+                -- already contain (left by an earlier update), so the command line
+                -- doesn't grow by one more "--multi" on every update.
+                local tmp = {}
+                local tlen = 0
+                local flag = "--multi"
+                local k = i
+                while k < n do
+                    local token_start = (k == i) or cl[k - 1] == 32
+                    local is_flag = false
+                    if token_start then
+                        is_flag = true
+                        for j = 1, #flag do
+                            if cl[k + j - 1] ~= flag:byte(j) then is_flag = false break end
+                        end
+                        if is_flag then
+                            local after = k + #flag
+                            if after < n and cl[after] ~= 32 then is_flag = false end
+                        end
+                    end
+                    if is_flag then
+                        k = k + #flag
+                    else
+                        tlen = tlen + 1
+                        tmp[tlen] = cl[k]
+                        k = k + 1
+                    end
                 end
-                for k = 1, #extra do
-                    buf[rest + k - 1] = extra:byte(k)
+                local extra = " --multi"
+                local buf = ffi.new("WCHAR[?]", tlen + #extra + 1)
+                for t = 1, tlen do
+                    buf[t - 1] = tmp[t]
+                end
+                for e = 1, #extra do
+                    buf[tlen + e - 1] = extra:byte(e)
                 end
                 return buf
             end)
@@ -244,6 +271,40 @@
     end
 
     local install_waiter = nil
+    local late_resume_timer = nil
+
+    -- The Replay Buffer was stopped for an update that then did NOT happen (it was
+    -- too slow to stop). If it finishes stopping afterwards, nobody would start it
+    -- again -- so watch for that and start it, for up to ~60 seconds.
+    local function resume_buffer_when_stopped()
+        if late_resume_timer ~= nil then
+            obs.timer_remove(late_resume_timer)
+        end
+        local tries = 0
+        local t
+        t = function()
+            tries = tries + 1
+            if obs.obs_frontend_replay_buffer_active() then
+                if tries >= 60 then
+                    obs.timer_remove(t)
+                    late_resume_timer = nil
+                end
+                return -- still active / still stopping: keep waiting
+            end
+            obs.timer_remove(t)
+            late_resume_timer = nil
+            obs.obs_frontend_replay_buffer_start()
+            obs.script_log(obs.LOG_INFO, "OBS Clip Suite: Replay Buffer started again after the cancelled update.")
+        end
+        late_resume_timer = t
+        obs.timer_add(t, 1000)
+    end
+    function Updater.cancel_late_resume()
+        if late_resume_timer ~= nil then
+            obs.timer_remove(late_resume_timer)
+            late_resume_timer = nil
+        end
+    end
 
     local function install_pending()
         local path, content = pending_update.path, pending_update.content
@@ -272,12 +333,14 @@
                         end
                         obs.script_log(obs.LOG_WARNING, "OBS Clip Suite: " .. last_check_result)
                     end
-                elseif tries >= 30 then
+                elseif tries >= 50 then -- ~10 seconds
                     obs.timer_remove(waiter)
                     install_waiter = nil
                     last_check_result = "The Replay Buffer wouldn't stop in time, so the update was NOT installed. " ..
                         "It will be offered again next time."
                     obs.script_log(obs.LOG_WARNING, "OBS Clip Suite: " .. last_check_result)
+                    -- It may still finish stopping a moment later: make sure it comes back.
+                    resume_buffer_when_stopped()
                 end
             end
             install_waiter = waiter
@@ -322,7 +385,15 @@
         -- the worst possible moment. "force" is set only for the manual
         -- "Check for Updates Now" button, where the user is demonstrably
         -- sitting in the Scripts window.
-        if not force and Sorter.foreground_is_fullscreen() then
+        -- Same for a live stream / recording / virtual camera: "Yes" would cut
+        -- them off, so the dialog waits until they are over.
+        if not force and (Sorter.foreground_is_fullscreen() or outputs_are_active()) then
+            return false
+        end
+
+        -- A dialog is already on screen (the modal one can let timers run):
+        -- never open a second one on top of it.
+        if Updater.prompt_open then
             return false
         end
 
@@ -340,7 +411,19 @@
             "stream or recording will be cut off -- finish or save\n" ..
             "anything important first."
 
-        local answer = Sorter.ask_yes_no_cancel(message, "OBS Clip Suite - update available")
+        Updater.prompt_open = true
+        local ask_ok, answer = pcall(Sorter.ask_yes_no_cancel, message, "OBS Clip Suite - update available")
+        Updater.prompt_open = false
+        if not ask_ok then
+            last_check_result = "Couldn't show the update dialog (" .. tostring(answer) .. ") -- nothing was changed."
+            obs.script_log(obs.LOG_WARNING, "OBS Clip Suite: " .. last_check_result)
+            pending_update = nil
+            return true
+        end
+        -- The timer-driven path may have cleared the update while the dialog was open.
+        if pending_update == nil then
+            return true
+        end
 
         if answer == nil then
             -- No dialog could be shown (non-Windows OBS, FFI unavailable).
@@ -370,7 +453,8 @@
         return true
     end
 
-    -- Retries a prompt that was held back because a game was fullscreen.
+    -- Retries a prompt that was held back because a game was fullscreen or a
+    -- stream / recording was active.
     -- Gives up after MAX_PROMPT_ATTEMPTS so a machine left in a game
     -- overnight doesn't keep a timer alive forever; the update is simply
     -- offered again on the next check.
@@ -383,8 +467,8 @@
         if prompt_attempts > MAX_PROMPT_ATTEMPTS then
             obs.timer_remove(retry_prompt)
             pending_update = nil
-            last_check_result = "An update is available but you stayed in a fullscreen app -- " ..
-                "it'll be offered again next time."
+            last_check_result = "An update is available but a fullscreen app or a stream/recording " ..
+                "stayed active -- it'll be offered again next time."
             return
         end
         if offer_pending_update(false) then
