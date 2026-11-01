@@ -1,6 +1,10 @@
 # OBS Clip Suite
 
-One OBS Studio script that makes **Replay Buffer clipping** painless on Windows.
+One OBS Studio script that makes OBS's normal Replay Buffer work like **NVIDIA instant replay (ShadowPlay)** on Windows:
+
+- every clip is **separate**, with no overlapping footage,
+- clips are **sorted into a folder per game**,
+- and you get a **sound** when a clip is saved.
 
 | | Module | What it does |
 |---|---|---|
