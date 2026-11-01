@@ -7,7 +7,7 @@ GitHub Releases. Each module has its own group and on/off checkbox.
 --]]
 
 -- Bump on every GitHub Release (compared numerically: 1.10.0 > 1.9.0).
-local VERSION = "2.14"
+local VERSION = "2.15"
 
 obs = obslua
 
@@ -334,10 +334,9 @@ do
         phase, phase_started = "waiting", now()
         obs.timer_remove(watchdog)
         obs.timer_add(watchdog, WATCHDOG_MS)
-        -- Nothing to wait for: stop right now instead of at the next watchdog tick.
-        if quiet <= 0 and pending_saves == 0 then
-            begin_stop()
-        end
+        -- The stop is deliberately NOT issued from inside this event callback: it
+        -- runs from the watchdog timer (next tick, <= 100 ms later), once OBS has
+        -- finished delivering the SAVED event and the muxer has let go of the file.
     end
 
     function Restarter.on_event(event)
