@@ -1,13 +1,13 @@
 --[[
 OBS Clip Suite -- one Tools > Scripts entry (add this single file).
-On every Replay Buffer save, in this order: Replay Organizer (per-game folder,
-Windows only) -> Clip Alert Sound (off by default) -> Restarter (stops + starts
-the buffer so clips don't overlap). The Update Checker updates this script from
+On every Replay Buffer save, in this order: Clip Alert Sound (off by default;
+plays first so it is never delayed) -> Replay Organizer (per-game folder,
+Windows only) -> Restarter (stops + starts the buffer so clips don't overlap). The Update Checker updates this script from
 GitHub Releases. Each module has its own group and on/off checkbox.
 --]]
 
 -- Bump on every GitHub Release (compared numerically: 1.10.0 > 1.9.0).
-local VERSION = "2.19"
+local VERSION = "2.20"
 
 obs = obslua
 

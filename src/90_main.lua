@@ -57,9 +57,11 @@ local dormant_old_instance = false
 local function on_frontend_event(event)
     if dormant_old_instance then return end
     if event == obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_SAVED then
-        -- Order matters: move the clip, play the sound, then restart the buffer.
-        guard("Sorter.on_replay_saved", Sorter.on_replay_saved)
+        -- Order matters: play the sound FIRST (it checks the clip is on disk at its
+        -- original path, and must not wait for the Organizer, whose first-time Steam
+        -- lookup can take seconds), then move the clip, then restart the buffer.
         guard("Alert.on_replay_saved", Alert.on_replay_saved)
+        guard("Sorter.on_replay_saved", Sorter.on_replay_saved)
         guard("Restarter.on_replay_saved", Restarter.on_replay_saved)
     end
     -- Every event reaches the Restarter so it can follow STOPPED / STARTED.

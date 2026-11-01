@@ -156,89 +156,59 @@ local function builtin_sound_path_for(choice)
 end
 
 -- ---------------------------------------------------------------------
--- The alert types
+-- The alert player
 -- ---------------------------------------------------------------------
--- The alert source is kept referenced here and watched by a small timer
--- (obs_source_media_get_state) instead of the old "media_ended" signal.
--- That signal fires on the source's own playback thread, and tearing the
--- source down from inside its own callback (which is what happened when a
--- second clip was saved while the first alert was still finishing) can
--- deadlock. The timer runs on OBS's normal script thread instead.
-local alert_source = nil
+-- Why it used to be slow / unreliable: every save built a brand-new
+-- ffmpeg_source, which had to open the file, start its decoder thread and
+-- open the audio monitoring device before the first sample could play, and
+-- tearing the previous one down could block for a moment too. On top of that
+-- the alert ran only after the Organizer had finished (a first-time Steam
+-- lookup can take seconds).
+--
+-- Now ONE private source is built ahead of time ("primed": file open,
+-- monitoring device ready, volume set) and kept, NOT on any output channel.
+-- A save only has to put it on the channel (restart_on_activate plays it
+-- from the start) and take it off again when it has finished. A fast poll
+-- checks that it really started; if it did not, it is nudged, and if it is
+-- still silent the source is rebuilt from scratch (twice at most).
+-- The alert is also confirmed against the real save (see confirm_and_play).
+local alert_source = nil          -- primed, reusable private ffmpeg_source
+local alert_source_path = nil     -- the file alert_source was built for
+local alert_attached = false      -- alert_source is on SOUND_CHANNEL right now
 local prewarm_sound -- forward-declared (assigned inside the module block below)
+local poll_alert    -- forward-declared (assigned below; release/attach use it)
 local alert_started_ns = 0
 local alert_seen_playing = false
-local ALERT_POLL_MS = 200
+local alert_nudged = false
+local alert_rebuilds = 0
+local ALERT_POLL_MS = 30          -- fast while a sound is playing, idle otherwise
+local ALERT_NUDGE_MS = 250        -- not audible yet: ask the media to restart
+local ALERT_REBUILD_MS = 700      -- still silent: rebuild the source from scratch
+local ALERT_MAX_REBUILDS = 2
 
-local function clear_sound_channel()
-    obs.obs_set_output_source(SOUND_CHANNEL, nil)
-    if alert_source ~= nil then
-        obs.obs_source_release(alert_source)
-        alert_source = nil
+-- Takes the source off the output channel (it stays alive and ready).
+local function detach_alert()
+    if alert_attached then
+        obs.obs_set_output_source(SOUND_CHANNEL, nil)
+        alert_attached = false
     end
     alert_seen_playing = false
 end
 
-local function poll_alert()
-    if alert_source == nil then
-        obs.timer_remove(poll_alert)
-        return
-    end
-    local state = obs.obs_source_media_get_state(alert_source)
-    if state == obs.OBS_MEDIA_STATE_PLAYING then
-        alert_seen_playing = true
-    elseif state == obs.OBS_MEDIA_STATE_ENDED or state == obs.OBS_MEDIA_STATE_ERROR
-        or (alert_seen_playing and state == obs.OBS_MEDIA_STATE_STOPPED) then
-        obs.timer_remove(poll_alert)
-        clear_sound_channel()
-        return
-    end
-    -- Safety net: a file that never reports an end (corrupt, looping, ...)
-    -- still frees the channel after the hold time.
-    if (obs.os_gettime_ns() - alert_started_ns) >= (sound_channel_hold_ms * 1e6) then
-        obs.timer_remove(poll_alert)
-        clear_sound_channel()
+-- Takes it off the channel AND drops it (settings changed / module off / unload).
+local function release_alert_source()
+    obs.timer_remove(poll_alert)
+    detach_alert()
+    if alert_source ~= nil then
+        obs.obs_source_release(alert_source)
+        alert_source = nil
+        alert_source_path = nil
     end
 end
 
-local last_alert_ns = 0
-local ALERT_MIN_GAP_NS = 1.5e9   -- hotkey spam must not create a new audio source per press
-
-local function do_sound_alert(force)
-    local now_ns = obs.os_gettime_ns()
-    if not force and (now_ns - last_alert_ns) < ALERT_MIN_GAP_NS then
-        return
-    end
-    last_alert_ns = now_ns
-    local path = custom_sound_path
-    if path ~= nil and path ~= "" then
-        -- A custom path that no longer exists (file renamed, drive
-        -- unplugged, sound folder cleaned out) used to just produce
-        -- silence with nothing in the log. Say so, then fall back to the
-        -- selected built-in sound so an alert still plays.
-        if not W.exists(path) then
-            obs.script_log(obs.LOG_WARNING,
-                "Clip Alert: custom sound file not found (" .. path ..
-                ") -- falling back to the built-in sound.")
-            path = ""
-        end
-    else
-        path = ""
-    end
-
-    if path == "" then
-        local choice = sound_choice_by_id(selected_sound_id)
-        path = builtin_sound_path_for(choice)
-        if not path then
-            return
-        end
-    end
-
-    -- Tear the PREVIOUS alert down completely first (timer stopped, channel
-    -- freed, reference released), so two saves close together can never
-    -- leave a stale watcher that cuts the new sound off.
-    obs.timer_remove(poll_alert)
-    clear_sound_channel()
+-- Builds the primed source for this file. Not on any channel yet.
+local function build_alert_source(path)
+    release_alert_source()
 
     local settings = obs.obs_data_create()
     obs.obs_data_set_string(settings, "local_file", path)
@@ -255,31 +225,178 @@ local function do_sound_alert(force)
 
     if not source then
         obs.script_log(obs.LOG_ERROR, "Clip Alert: failed to create internal sound source.")
-        return
+        return false
     end
 
     -- "Monitor Only" makes it actually audible through your speakers
     -- in real time, without also baking it into any recording/stream
-    -- output.
+    -- output. Set here, ahead of time, so the monitoring device is already
+    -- open when the first alert plays.
     obs.obs_source_set_monitoring_type(source, obs.OBS_MONITORING_TYPE_MONITOR_ONLY)
 
     -- User-controlled alert volume (a multiplier on top of OBS's own
     -- per-source volume, which defaults to 100% for a fresh source).
     obs.obs_source_set_volume(source, alert_volume_pct / 100)
 
-    obs.obs_set_output_source(SOUND_CHANNEL, source)
-
-    -- Keep our own reference (released in clear_sound_channel) so the poll
-    -- below can read the playback state.
     alert_source = source
+    alert_source_path = path
+    return true
+end
+
+-- Which file should play: the custom one if it exists, else the built-in.
+local function resolve_alert_path()
+    local path = custom_sound_path
+    if path ~= nil and path ~= "" then
+        -- A custom path that no longer exists (file renamed, drive
+        -- unplugged, sound folder cleaned out) used to just produce
+        -- silence with nothing in the log. Say so, then fall back to the
+        -- selected built-in sound so an alert still plays.
+        if W.exists(path) then
+            return path
+        end
+        obs.script_log(obs.LOG_WARNING,
+            "Clip Alert: custom sound file not found (" .. path ..
+            ") -- falling back to the built-in sound.")
+    end
+    return builtin_sound_path_for(sound_choice_by_id(selected_sound_id))
+end
+
+-- Puts the primed source on the output channel = plays it from the start,
+-- and (re)starts the poll that watches it.
+local function attach_alert()
+    -- A sound still playing from a previous save: take it off first so the
+    -- activation (and with it "restart on activate") happens again.
+    detach_alert()
+    obs.obs_set_output_source(SOUND_CHANNEL, alert_source)
+    alert_attached = true
     alert_started_ns = obs.os_gettime_ns()
     alert_seen_playing = false
+    alert_nudged = false
+    obs.timer_remove(poll_alert)
     obs.timer_add(poll_alert, ALERT_POLL_MS)
+end
+
+local function finish_alert()
+    obs.timer_remove(poll_alert)
+    detach_alert()
+    -- Module switched off (only the Test button played): don't keep it around.
+    if not alert_sound then
+        release_alert_source()
+    end
+end
+
+poll_alert = function()
+    if alert_source == nil or not alert_attached then
+        obs.timer_remove(poll_alert)
+        return
+    end
+    local state = obs.obs_source_media_get_state(alert_source)
+    local elapsed_ms = (obs.os_gettime_ns() - alert_started_ns) / 1e6
+
+    if state == obs.OBS_MEDIA_STATE_PLAYING then
+        alert_seen_playing = true
+    elseif alert_seen_playing then
+        -- It played and is over now. (An ENDED left over from the previous
+        -- play is ignored until PLAYING has been seen again.)
+        if state == obs.OBS_MEDIA_STATE_ENDED or state == obs.OBS_MEDIA_STATE_ERROR
+            or state == obs.OBS_MEDIA_STATE_STOPPED then
+            return finish_alert()
+        end
+    elseif state == obs.OBS_MEDIA_STATE_ERROR or elapsed_ms >= ALERT_REBUILD_MS then
+        -- Never became audible: start over with a fresh source.
+        alert_rebuilds = alert_rebuilds + 1
+        local path = alert_source_path
+        if alert_rebuilds > ALERT_MAX_REBUILDS or path == nil or not build_alert_source(path) then
+            obs.script_log(obs.LOG_WARNING, "Clip Alert: the sound did not start.")
+            obs.timer_remove(poll_alert)
+            detach_alert()
+            return
+        end
+        return attach_alert()
+    elseif elapsed_ms >= ALERT_NUDGE_MS and not alert_nudged then
+        alert_nudged = true
+        obs.obs_source_media_restart(alert_source)
+    end
+
+    -- Safety net: a file that never reports an end (corrupt, looping, ...)
+    -- still frees the channel after the hold time.
+    if elapsed_ms >= sound_channel_hold_ms then
+        finish_alert()
+    end
+end
+
+local last_alert_ns = 0
+local ALERT_MIN_GAP_NS = 0.25e9   -- only drops a duplicate event, never a real second save
+
+local function do_sound_alert(force)
+    local now_ns = obs.os_gettime_ns()
+    if not force and (now_ns - last_alert_ns) < ALERT_MIN_GAP_NS then
+        return
+    end
+    last_alert_ns = now_ns
+
+    local path = resolve_alert_path()
+    if not path then
+        return
+    end
+
+    -- Normally already primed, so this is skipped and the sound starts at once.
+    if alert_source == nil or alert_source_path ~= path then
+        if not build_alert_source(path) then
+            return
+        end
+    end
+    alert_rebuilds = 0
+    attach_alert()
+end
+
+-- ---------------------------------------------------------------------
+-- Confirmation: the sound means "the clip is saved", not "you pressed the key"
+-- ---------------------------------------------------------------------
+-- It is only ever started from OBS's REPLAY_BUFFER_SAVED event (fired after the
+-- clip has been written), and on top of that the file OBS reports for it must
+-- really exist on disk. This runs BEFORE the Organizer moves the clip, so the
+-- original path is still valid. If OBS gives no path at all the event itself
+-- is trusted (a silent alert would be worse than an unchecked one).
+local save_verify_tries = 0
+
+local function last_saved_status()
+    local rb = obs.obs_frontend_get_replay_buffer_output()
+    if rb == nil then
+        return "unknown", nil
+    end
+    local cd = obs.calldata_create()
+    obs.proc_handler_call(obs.obs_output_get_proc_handler(rb), "get_last_replay", cd)
+    local path = obs.calldata_string(cd, "path")
+    obs.calldata_destroy(cd)
+    obs.obs_output_release(rb)
+    if path == nil or path == "" then
+        return "unknown", nil
+    end
+    return (W.exists(path) and "ok" or "missing"), path
+end
+
+local function confirm_and_play()
+    obs.timer_remove(confirm_and_play)
+    local status, path = last_saved_status()
+    if status == "missing" then
+        -- Not on disk (yet): look again a few times before giving up.
+        save_verify_tries = save_verify_tries + 1
+        if save_verify_tries <= 3 then
+            obs.timer_add(confirm_and_play, 120)
+        else
+            obs.script_log(obs.LOG_WARNING,
+                "Clip Alert: no sound -- OBS reported a save but the file is not on disk: " .. tostring(path))
+        end
+        return
+    end
+    do_sound_alert(false)
 end
 
     local function trigger_alerts()
         if alert_sound then
-            do_sound_alert()
+            save_verify_tries = 0
+            confirm_and_play()
         end
     end
 
@@ -356,10 +473,17 @@ end
 
     -- Decode the chosen built-in sound shortly after load/changes, so the first
     -- real alert doesn't stutter while it is being decoded.
+    -- (Also builds the primed audio source, so the alert starts instantly.)
     prewarm_sound = function()
         obs.timer_remove(prewarm_sound)
-        if alert_sound and (custom_sound_path == nil or custom_sound_path == "") then
-            pcall(builtin_sound_path_for, sound_choice_by_id(selected_sound_id))
+        if not alert_sound then
+            if not alert_attached then release_alert_source() end
+            return
+        end
+        if alert_attached then return end   -- never disturb a sound that is playing
+        local ok, path = pcall(resolve_alert_path)
+        if ok and path and (alert_source == nil or alert_source_path ~= path) then
+            pcall(build_alert_source, path)
         end
     end
 
@@ -391,19 +515,23 @@ end
     if new_channel < 0 or new_channel > 63 then
         new_channel = 63
     end
+    -- Volume changes apply live to the primed source (no rebuild needed).
+    if alert_source ~= nil then
+        obs.obs_source_set_volume(alert_source, alert_volume_pct / 100)
+    end
     obs.timer_remove(prewarm_sound)
-    obs.timer_add(prewarm_sound, 2000)
+    obs.timer_add(prewarm_sound, 1500)
     if new_channel ~= SOUND_CHANNEL then
         obs.timer_remove(poll_alert)
-        clear_sound_channel()
+        detach_alert()   -- off the OLD channel before the number changes
         SOUND_CHANNEL = new_channel
     end
 end
 
     function Alert.script_unload()
-        obs.timer_remove(poll_alert)
         obs.timer_remove(prewarm_sound)
-        clear_sound_channel()
+        obs.timer_remove(confirm_and_play)
+        release_alert_source()   -- also stops poll_alert and frees the temp file handle
         -- Remove the decoded temp copies of the built-in sounds.
         for id, path in pairs(decoded_paths) do
             W.remove(path)

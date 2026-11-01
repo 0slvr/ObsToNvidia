@@ -35,7 +35,13 @@ Each module has its own group with an on/off checkbox in its header.
 
 ---
 
+<<<<<<< HEAD
 ## How it works
+=======
+1. The Alert plays its sound (first, so it is never delayed by the Organizer). It only plays for a real save: the `Saved` event plus the clip file being on disk.
+2. The Organizer moves the clip into its folder.
+3. The Restarter stops and restarts the Replay Buffer.
+>>>>>>> fd041e9 (Release v2.20)
 
 When a clip is saved, the modules run in this order: **Organizer → Alert Sound → Restarter**.
 An error in one module never stops the others.
