@@ -7,7 +7,7 @@ GitHub Releases. Each module has its own group and on/off checkbox.
 --]]
 
 -- Bump on every GitHub Release (compared numerically: 1.10.0 > 1.9.0).
-local VERSION = "2.22"
+local VERSION = "2.23"
 
 obs = obslua
 
@@ -351,6 +351,13 @@ do
             -- A save has begun (OBS 30.2+; on older versions this event doesn't
             -- exist and the module simply relies on the quiet period).
             local t = now()
+            -- A SAVING that never got its SAVED (failed save) leaves pending_saves
+            -- stuck above 0. Once it is stale it must not be counted on top of the
+            -- new save, or the next restart waits ~STALE_MS for a SAVED that
+            -- never comes (clips of two saves would overlap in that time).
+            if pending_saves > 0 and t - last_saving_at > STALE_MS then
+                pending_saves = 0
+            end
             if pending_saves > 0 and t - last_saving_at <= STALE_MS then
                 -- OBS writes one clip at a time and ignores save presses (key held,
                 -- double press) while one is being written -- yet still announces each
@@ -2928,6 +2935,20 @@ C.FILE_ATTRIBUTE_HIDDEN     = 0x2
 -- not be able to stall OBS for long. Worst case (each phase timing out
 -- in sequence) is bounded to roughly the sum of these four values.
 C.WINHTTP_ACCESS_TYPE_DEFAULT_PROXY = 0
+C.WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY = 4  -- Windows 8.1+; WinHttpOpen fails on older ones
+
+-- Win32 error code of the FFI call that JUST returned. ffi.errno() is the
+-- supported way: LuaJIT saves the last error right after every FFI call, while
+-- a separate kernel32.GetLastError() call can already see a value changed by
+-- LuaJIT / the GC in between. Falls back to GetLastError if ffi.errno is
+-- missing. Call it immediately after the failing call, before any other FFI call.
+-- (A field of C, not a local: the chunk is close to LuaJIT's 200-locals limit.)
+function C.last_error()
+    if ffi ~= nil and ffi.errno ~= nil then
+        return tonumber(ffi.errno())
+    end
+    return tonumber(kernel32.GetLastError())
+end
 C.WINHTTP_FLAG_SECURE               = 0x00800000
 -- Kept short on purpose -- this call runs synchronously on OBS's
 -- frontend-event thread (the same thread that has to restart the Replay
@@ -3386,6 +3407,9 @@ local function fg_poll_tick()
     if not ok or info == nil then
         return
     end
+    -- Lets the Steam-name code queue a background lookup for a brand-new game
+    -- (defined further down; nothing here waits for the network).
+    if Sorter.note_foreground then pcall(Sorter.note_foreground, info) end
 
     local last = fg_history[#fg_history]
     -- Polling is skipped entirely whenever the Replay Buffer isn't running
@@ -3436,13 +3460,17 @@ local function get_dominant_foreground(seconds)
 
     local now = obs.os_gettime_ns()
     local window_start = now - (seconds * 1e9)
-    local totals = {} -- "exe\0title" -> { duration_ns = n, info = {...} }
+    -- Grouped by exe ONLY, not exe + title: a game whose window title keeps
+    -- changing (FPS counter, level name, server) used to be split into many
+    -- small entries, and a short-lived window with a steady title (Discord)
+    -- could out-score the game's total time.
+    local totals = {} -- lower exe name -> { duration_ns = n, info = {...} }
 
     for _, entry in ipairs(fg_history) do
         local s = math.max(entry.start_ns, window_start)
         local e = math.min(entry.end_ns, now)
         if e > s then
-            local key = entry.exe_name .. "\0" .. (entry.window_title or "")
+            local key = entry.exe_name:lower()
             local rec = totals[key]
             if not rec then
                 rec = { duration_ns = 0, info = entry }
@@ -3450,8 +3478,8 @@ local function get_dominant_foreground(seconds)
             end
             rec.last_ns = entry.end_ns
             -- The history is chronological, so this ends up holding the LATEST
-            -- sample of this app/window -- i.e. its most recent fullscreen
-            -- state, which is what decides Desktop vs. game folder.
+            -- sample of this app -- i.e. its most recent window title and
+            -- fullscreen state, which is what decides Desktop vs. game folder.
             rec.info = entry
             rec.duration_ns = rec.duration_ns + (e - s)
         end
@@ -3951,6 +3979,7 @@ end
             obs.timer_remove(retry)
         end
         pending_move_timers = {}
+        if Sorter.cancel_steam_queue then Sorter.cancel_steam_queue() end
     end
 
     function Sorter.script_update(settings)
@@ -4197,6 +4226,9 @@ end
 -- matches. The first result used to be taken blindly, which for an
 -- unrelated exe name meant a random game's name became a folder name --
 -- "no match" now means the plain exe name is used instead, which is safer.
+-- Second return value: true for an EXACT match, false for a partial one.
+-- Only exact matches are trusted enough to be saved to known_games.txt
+-- ("cod" would otherwise match "Decode" and be remembered forever).
 local function pick_steam_name(names, query)
     local words = {}
     for w in query:lower():gmatch("[^%s]+") do
@@ -4212,13 +4244,13 @@ local function pick_steam_name(names, query)
     for _, name in ipairs(names) do
         local n = normalize_for_match(name)
         if n == q then
-            return name
+            return name, true
         end
         if partial == nil and #n >= 3 and (n:find(q, 1, true) or q:find(n, 1, true)) then
             partial = name
         end
     end
-    return partial
+    return partial, false
 end
 
 -- Blocking HTTPS GET over WinHTTP. Runs on whatever thread calls it
@@ -4229,6 +4261,34 @@ end
 C.WINHTTP_QUERY_STATUS_CODE   = 19
 C.WINHTTP_QUERY_CONTENT_LENGTH = 5
 C.WINHTTP_QUERY_FLAG_NUMBER   = 0x20000000
+
+-- Network circuit breaker, per host. Every request here is a BLOCKING call on
+-- OBS's own thread, so a dead connection must not be retried over and over:
+-- after 2 failures in a row the host is skipped for 2 minutes, then 4, 8 ...
+-- up to 30 minutes. One success clears it. A caller that was started by the
+-- user (the "Check for Updates Now" button) passes timeouts.force = true.
+-- (Kept in the shared C table: the chunk is close to LuaJIT's 200-locals limit.)
+C.net_state = {}
+function C.net_blocked(host)
+    local st = C.net_state[host]
+    return st ~= nil and st.until_ns ~= nil and obs.os_gettime_ns() < st.until_ns
+end
+function C.net_record(host, ok)
+    local st = C.net_state[host]
+    if st == nil then
+        st = { fails = 0 }
+        C.net_state[host] = st
+    end
+    if ok then
+        st.fails, st.until_ns = 0, nil
+        return
+    end
+    st.fails = st.fails + 1
+    if st.fails >= 2 then
+        local wait_s = math.min(1800, 120 * 2 ^ (st.fails - 2))
+        st.until_ns = obs.os_gettime_ns() + wait_s * 1e9
+    end
+end
 
 -- Reads a numeric response header (status code, Content-Length) or nil.
 local function query_number_header(hRequest, selector)
@@ -4254,6 +4314,9 @@ end
 -- mid-transfer and returned a TRUNCATED body as if it were complete.
 local function https_get(host, path_and_query, timeouts)
     timeouts = timeouts or {}
+    if not timeouts.force and C.net_blocked(host) then
+        return nil -- the circuit breaker is open for this host (see C.net_record)
+    end
     local hSession, hConnect, hRequest = nil, nil, nil
 
     -- Closes whatever got opened, in reverse order. It runs exactly once,
@@ -4270,8 +4333,15 @@ local function https_get(host, path_and_query, timeouts)
     end
 
     local ok, body = pcall(function()
+        -- Automatic proxy (Windows 8.1+) follows the system's proxy auto-config
+        -- like a browser does; the plain default fails behind a PAC/WPAD proxy.
+        -- Older Windows refuses it: fall back to the default.
         hSession = winhttp.WinHttpOpen(utf8_to_wide("OBS-ReplayOrganizer/1.0"),
-            C.WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, nil, nil, 0)
+            C.WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, nil, nil, 0)
+        if hSession == nil then
+            hSession = winhttp.WinHttpOpen(utf8_to_wide("OBS-ReplayOrganizer/1.0"),
+                C.WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, nil, nil, 0)
+        end
         if hSession == nil then return nil end
 
         winhttp.WinHttpSetTimeouts(hSession,
@@ -4332,7 +4402,11 @@ local function https_get(host, path_and_query, timeouts)
         return table.concat(chunks)
     end)
     close_all()
-    if ok then return body end
+    if ok and body ~= nil then
+        C.net_record(host, true)
+        return body
+    end
+    C.net_record(host, false)
     return nil
 end
 
@@ -4341,6 +4415,7 @@ end
 -- WinHTTP plumbing instead of redeclaring the whole ffi.cdef a second
 -- time (which would error on the duplicate typedefs/prototypes).
 Sorter.https_get = https_get
+Sorter.net_blocked = C.net_blocked
 
 -- Appends a new "raw=friendly" line to known_games.txt so a successful
 -- Steam lookup is remembered permanently, not just for this session.
@@ -4383,7 +4458,11 @@ local function persist_known_game(raw_exe_name, friendly)
     persisted_this_session[line] = true
 end
 
-local function steam_lookup_name(raw_exe_name)
+-- The blocking lookup itself. Only ever called from the background timer
+-- below, never from the save handler or the foreground poll: a few hundred ms
+-- to ~2 s of a stalled OBS is fine for the first sighting of a game, but not
+-- in the middle of a save (which restarts the Replay Buffer right after).
+local function steam_lookup_now(raw_exe_name)
     local lower = raw_exe_name:lower()
     if not steam_lookup_enabled or GENERIC_HOST_EXES[lower] then
         return nil
@@ -4392,10 +4471,10 @@ local function steam_lookup_name(raw_exe_name)
         return steam_lookup_cache[lower]
     end
     if steam_lookup_failed[lower] then
-        -- Already tried and failed once this session (offline, Steam
-        -- unreachable, no match, ...) -- don't hammer the network again
-        -- on every single save until OBS restarts.
         return nil
+    end
+    if C.net_blocked("store.steampowered.com") then
+        return nil -- circuit breaker open: not marked as failed, tried again later
     end
 
     -- Turn e.g. "VALORANT-Win64-Shipping" into a plausible search term
@@ -4415,17 +4494,75 @@ local function steam_lookup_name(raw_exe_name)
         return nil
     end
 
-    local name = pick_steam_name(json_extract_names(body), query)
+    local name, exact = pick_steam_name(json_extract_names(body), query)
     if not name or name == "" then
         steam_lookup_failed[lower] = true
         return nil
     end
 
     steam_lookup_cache[lower] = name
-    KNOWN_GAMES[lower] = name -- instant for the rest of THIS session too
-    persist_known_game(raw_exe_name, name)
-    print("OBS Replay Organizer: Steam lookup found '" .. name .. "' for '" .. raw_exe_name .. "' -- saved to known_games.txt.")
+    if exact then
+        KNOWN_GAMES[lower] = name -- instant for the rest of THIS session too
+        persist_known_game(raw_exe_name, name)
+        print("OBS Replay Organizer: Steam lookup found '" .. name .. "' for '" .. raw_exe_name .. "' -- saved to known_games.txt.")
+    else
+        -- A partial match is a guess: use it for this session only, never save it.
+        print("OBS Replay Organizer: Steam lookup guessed '" .. name .. "' for '" .. raw_exe_name .. "' (not an exact match, so not saved).")
+    end
     return name
+end
+
+-- Background queue of exe names waiting for a Steam lookup (one chunk-level
+-- local on purpose, see the locals-limit note above).
+local steam_q = { list = {}, queued = {}, seen = {} }
+
+local function steam_q_schedule(ms)
+    obs.timer_remove(steam_q.tick)
+    obs.timer_add(steam_q.tick, ms)
+end
+
+steam_q.tick = function()
+    obs.timer_remove(steam_q.tick)
+    if #steam_q.list == 0 then return end
+    -- Never stall a live stream or a recording: try again later.
+    if obs.obs_frontend_streaming_active() or obs.obs_frontend_recording_active() then
+        steam_q_schedule(30000)
+        return
+    end
+    local raw = table.remove(steam_q.list, 1)
+    steam_q.queued[raw:lower()] = nil
+    local ok, err = pcall(steam_lookup_now, raw)
+    if not ok then
+        steam_lookup_failed[raw:lower()] = true
+        print("OBS Replay Organizer: Steam lookup error for '" .. raw .. "': " .. tostring(err))
+    end
+    if #steam_q.list > 0 then steam_q_schedule(2000) end
+end
+
+function Sorter.cancel_steam_queue()
+    obs.timer_remove(steam_q.tick)
+    steam_q.list, steam_q.queued, steam_q.seen = {}, {}, {}
+end
+
+-- Used while a clip is being sorted. NEVER touches the network: it returns what
+-- is already known this session, otherwise queues a background lookup and
+-- returns nil (the caller falls back to the exe name for this one clip; the
+-- next save of the game uses the Steam name).
+local function steam_lookup_name(raw_exe_name)
+    local lower = raw_exe_name:lower()
+    if not steam_lookup_enabled or GENERIC_HOST_EXES[lower] then
+        return nil
+    end
+    if steam_lookup_cache[lower] then
+        return steam_lookup_cache[lower]
+    end
+    if steam_lookup_failed[lower] or steam_q.queued[lower] then
+        return nil
+    end
+    steam_q.queued[lower] = true
+    steam_q.list[#steam_q.list + 1] = raw_exe_name
+    steam_q_schedule(1500)
+    return nil
 end
 
 -- Names taken from a window title, remembered for THIS OBS session only
@@ -4563,6 +4700,26 @@ local function friendly_name(raw_exe_name, window_title, is_fullscreen, exe_path
     return raw_exe_name:match("^([^%.%-]+)") or raw_exe_name
 end
 
+-- Called by the foreground poll (see fg_poll_tick) for the app in front. The
+-- first time a fullscreen, untitled game from a game library shows up with no
+-- known name, its Steam lookup is queued right away, so the name is usually
+-- ready by the time the first clip is saved (instead of being looked up in the
+-- middle of that save). Once per exe per session; mirrors the checks that
+-- on_replay_saved + friendly_name make before they would reach a lookup.
+function Sorter.note_foreground(info)
+    if not steam_lookup_enabled or info == nil or info.protected or not info.is_fullscreen then
+        return
+    end
+    local exe = info.exe_name
+    if exe == nil or exe == "" then return end
+    local lower = exe:lower()
+    if steam_q.seen[lower] then return end
+    steam_q.seen[lower] = true
+    if name_map[lower] or KNOWN_GAMES[lower] or GENERIC_HOST_EXES[lower] or NON_GAME_EXES[lower] then return end
+    if info.window_title ~= nil and info.window_title ~= "" then return end
+    if not is_in_game_library(info.exe_path) or steam_folder_name(info.exe_path) then return end
+    steam_lookup_name(exe)
+end
 -- Creates dest_folder via a direct Win32 call (no cmd.exe / mkdir process).
 -- Only handles a single-level create, same as the old "mkdir" call did;
 -- OBS's own replay folder must already exist, we're just creating the
@@ -4571,7 +4728,7 @@ local function ensure_folder(win_folder)
     local wide_folder = utf8_to_wide(win_folder)
     local ok = kernel32.CreateDirectoryW(wide_folder, nil)
     if ok == 0 then
-        local err = kernel32.GetLastError()
+        local err = C.last_error()
         if err ~= C.ERROR_ALREADY_EXISTS then
             print("OBS Replay Organizer: CreateDirectoryW failed for '" .. win_folder ..
                   "' (error " .. tostring(err) .. ").")
@@ -4665,7 +4822,7 @@ local function move_file(src, dest_folder, new_base_name, on_moved_later)
     if kernel32.MoveFileExW(wide_src, wide_dest, C.MOVEFILE_COPY_ALLOWED) ~= 0 then
         return win_dest
     end
-    local err = kernel32.GetLastError()
+    local err = C.last_error()
 
     if not is_lock_error(err) or on_moved_later == nil then
         -- Some other error -- retrying won't help, fail fast. (Returning the
@@ -4686,7 +4843,7 @@ local function move_file(src, dest_folder, new_base_name, on_moved_later)
             on_moved_later(win_dest)
             return
         end
-        local retry_err = kernel32.GetLastError()
+        local retry_err = C.last_error()
         if not is_lock_error(retry_err) or attempt >= C.MOVE_RETRY_ATTEMPTS then
             obs.timer_remove(retry)
             pending_move_timers[retry] = nil
@@ -5103,7 +5260,7 @@ do
         local moved = kernel32.MoveFileExW(utf8_to_wide(tmp_path), utf8_to_wide(path),
             C.MOVEFILE_REPLACE_EXISTING + C.MOVEFILE_WRITE_THROUGH)
         if moved == 0 then
-            local err = kernel32.GetLastError()
+            local err = C.last_error()
             W.remove(tmp_path)
             return false, "couldn't replace the script file (Windows error " .. tostring(err) ..
                 ") -- your current script was not touched"
@@ -5676,7 +5833,15 @@ do
         -- the top. This is what runs on every OBS start, so a slow
         -- connection costs a few seconds at most instead of a full ~290 KB
         -- download on OBS's UI thread.
-        local probe = Sorter.https_get(GITHUB_HOST, LATEST_ASSET_PATH, VERSION_PROBE_TIMEOUTS)
+        -- A check the person asked for ("Check for Updates Now") ignores the network
+        -- circuit breaker (see C.net_record); the automatic one respects it.
+        local function timeouts_for(base)
+            local copy = {}
+            for k, v in pairs(base) do copy[k] = v end
+            copy.force = manual and true or nil
+            return copy
+        end
+        local probe = Sorter.https_get(GITHUB_HOST, LATEST_ASSET_PATH, timeouts_for(VERSION_PROBE_TIMEOUTS))
         local probe_version = probe and extract_version(probe) or nil
         if probe_version ~= nil then
             if compare_versions(probe_version, VERSION) <= 0 then
@@ -5713,7 +5878,7 @@ do
         -- If the server ignored the Range header and the probe already
         -- returned the whole file, there's no need to download it again.
         local remote_content = (probe and #probe >= 50000) and probe
-            or Sorter.https_get(GITHUB_HOST, LATEST_ASSET_PATH, SCRIPT_DL_TIMEOUTS)
+            or Sorter.https_get(GITHUB_HOST, LATEST_ASSET_PATH, timeouts_for(SCRIPT_DL_TIMEOUTS))
         if not remote_content then
             last_check_result = "Couldn't reach GitHub to check for updates (offline, or no " ..
                 "Release with a '" .. SCRIPT_FILENAME .. "' asset exists yet)."
@@ -6071,6 +6236,23 @@ local function each_module(hook, ...)
     end
 end
 
+-- OBS only shows a description when the script defines a GLOBAL
+-- script_description(); the per-module ones (Sorter/Alert/Updater) were never
+-- called. Joins them in the same order as the groups in the Scripts window.
+function script_description()
+    local parts = {
+        "<h3>1) Replay Buffer Restarter</h3><p>Restarts the Replay Buffer after every " ..
+        "save so back-to-back clips never share overlapping footage.</p>",
+    }
+    for _, m in ipairs({ { "Sorter", Sorter }, { "Alert", Alert }, { "Updater", Updater } }) do
+        if m[2].script_description then
+            local ok, text = pcall(m[2].script_description)
+            if ok and type(text) == "string" then parts[#parts + 1] = text end
+        end
+    end
+    return table.concat(parts, "\n")
+end
+
 function script_defaults(settings) each_module("script_defaults", settings) end
 function script_update(settings) each_module("script_update", settings) end
 
@@ -6098,7 +6280,7 @@ local function process_is_running(pid)
     if h == nil then
         -- Access denied (5) means it exists but belongs to a higher-privilege
         -- process (e.g. OBS run as admin): still running. Anything else: gone.
-        return kernel32.GetLastError() == 5
+        return C.last_error() == 5
     end
     local r = kernel32.WaitForSingleObject(h, 0)
     kernel32.CloseHandle(h)

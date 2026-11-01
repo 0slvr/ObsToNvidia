@@ -411,12 +411,14 @@ static string? FindRoot(string? hint)
 // shows it in the Error List and fails the build before the file ever reaches OBS.
 static int SyntaxCheck(string luaFile)
 {
+    // luajit first: OBS runs LuaJIT, so it is the only checker that matches the real
+    // target. A plain "luac" on PATH is usually Lua 5.4, which accepts/rejects different syntax.
     var candidates = new (string exe, string args)[]
     {
-        ("luac",     $"-p \"{luaFile}\""),
-        ("luac5.1",  $"-p \"{luaFile}\""),
-        ("luac5.4",  $"-p \"{luaFile}\""),
         ("luajit",   $"-bl \"{luaFile}\""),
+        ("luac5.1",  $"-p \"{luaFile}\""),
+        ("luac",     $"-p \"{luaFile}\""),
+        ("luac5.4",  $"-p \"{luaFile}\""),
     };
 
     foreach (var (exe, a) in candidates)

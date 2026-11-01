@@ -6,7 +6,7 @@ local function ensure_folder(win_folder)
     local wide_folder = utf8_to_wide(win_folder)
     local ok = kernel32.CreateDirectoryW(wide_folder, nil)
     if ok == 0 then
-        local err = kernel32.GetLastError()
+        local err = C.last_error()
         if err ~= C.ERROR_ALREADY_EXISTS then
             print("OBS Replay Organizer: CreateDirectoryW failed for '" .. win_folder ..
                   "' (error " .. tostring(err) .. ").")
@@ -100,7 +100,7 @@ local function move_file(src, dest_folder, new_base_name, on_moved_later)
     if kernel32.MoveFileExW(wide_src, wide_dest, C.MOVEFILE_COPY_ALLOWED) ~= 0 then
         return win_dest
     end
-    local err = kernel32.GetLastError()
+    local err = C.last_error()
 
     if not is_lock_error(err) or on_moved_later == nil then
         -- Some other error -- retrying won't help, fail fast. (Returning the
@@ -121,7 +121,7 @@ local function move_file(src, dest_folder, new_base_name, on_moved_later)
             on_moved_later(win_dest)
             return
         end
-        local retry_err = kernel32.GetLastError()
+        local retry_err = C.last_error()
         if not is_lock_error(retry_err) or attempt >= C.MOVE_RETRY_ATTEMPTS then
             obs.timer_remove(retry)
             pending_move_timers[retry] = nil

@@ -269,6 +269,20 @@ C.FILE_ATTRIBUTE_HIDDEN     = 0x2
 -- not be able to stall OBS for long. Worst case (each phase timing out
 -- in sequence) is bounded to roughly the sum of these four values.
 C.WINHTTP_ACCESS_TYPE_DEFAULT_PROXY = 0
+C.WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY = 4  -- Windows 8.1+; WinHttpOpen fails on older ones
+
+-- Win32 error code of the FFI call that JUST returned. ffi.errno() is the
+-- supported way: LuaJIT saves the last error right after every FFI call, while
+-- a separate kernel32.GetLastError() call can already see a value changed by
+-- LuaJIT / the GC in between. Falls back to GetLastError if ffi.errno is
+-- missing. Call it immediately after the failing call, before any other FFI call.
+-- (A field of C, not a local: the chunk is close to LuaJIT's 200-locals limit.)
+function C.last_error()
+    if ffi ~= nil and ffi.errno ~= nil then
+        return tonumber(ffi.errno())
+    end
+    return tonumber(kernel32.GetLastError())
+end
 C.WINHTTP_FLAG_SECURE               = 0x00800000
 -- Kept short on purpose -- this call runs synchronously on OBS's
 -- frontend-event thread (the same thread that has to restart the Replay

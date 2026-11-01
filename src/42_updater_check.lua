@@ -31,7 +31,15 @@
         -- the top. This is what runs on every OBS start, so a slow
         -- connection costs a few seconds at most instead of a full ~290 KB
         -- download on OBS's UI thread.
-        local probe = Sorter.https_get(GITHUB_HOST, LATEST_ASSET_PATH, VERSION_PROBE_TIMEOUTS)
+        -- A check the person asked for ("Check for Updates Now") ignores the network
+        -- circuit breaker (see C.net_record); the automatic one respects it.
+        local function timeouts_for(base)
+            local copy = {}
+            for k, v in pairs(base) do copy[k] = v end
+            copy.force = manual and true or nil
+            return copy
+        end
+        local probe = Sorter.https_get(GITHUB_HOST, LATEST_ASSET_PATH, timeouts_for(VERSION_PROBE_TIMEOUTS))
         local probe_version = probe and extract_version(probe) or nil
         if probe_version ~= nil then
             if compare_versions(probe_version, VERSION) <= 0 then
@@ -68,7 +76,7 @@
         -- If the server ignored the Range header and the probe already
         -- returned the whole file, there's no need to download it again.
         local remote_content = (probe and #probe >= 50000) and probe
-            or Sorter.https_get(GITHUB_HOST, LATEST_ASSET_PATH, SCRIPT_DL_TIMEOUTS)
+            or Sorter.https_get(GITHUB_HOST, LATEST_ASSET_PATH, timeouts_for(SCRIPT_DL_TIMEOUTS))
         if not remote_content then
             last_check_result = "Couldn't reach GitHub to check for updates (offline, or no " ..
                 "Release with a '" .. SCRIPT_FILENAME .. "' asset exists yet)."

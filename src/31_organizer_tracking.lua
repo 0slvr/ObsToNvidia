@@ -62,6 +62,9 @@ local function fg_poll_tick()
     if not ok or info == nil then
         return
     end
+    -- Lets the Steam-name code queue a background lookup for a brand-new game
+    -- (defined further down; nothing here waits for the network).
+    if Sorter.note_foreground then pcall(Sorter.note_foreground, info) end
 
     local last = fg_history[#fg_history]
     -- Polling is skipped entirely whenever the Replay Buffer isn't running
@@ -112,13 +115,17 @@ local function get_dominant_foreground(seconds)
 
     local now = obs.os_gettime_ns()
     local window_start = now - (seconds * 1e9)
-    local totals = {} -- "exe\0title" -> { duration_ns = n, info = {...} }
+    -- Grouped by exe ONLY, not exe + title: a game whose window title keeps
+    -- changing (FPS counter, level name, server) used to be split into many
+    -- small entries, and a short-lived window with a steady title (Discord)
+    -- could out-score the game's total time.
+    local totals = {} -- lower exe name -> { duration_ns = n, info = {...} }
 
     for _, entry in ipairs(fg_history) do
         local s = math.max(entry.start_ns, window_start)
         local e = math.min(entry.end_ns, now)
         if e > s then
-            local key = entry.exe_name .. "\0" .. (entry.window_title or "")
+            local key = entry.exe_name:lower()
             local rec = totals[key]
             if not rec then
                 rec = { duration_ns = 0, info = entry }
@@ -126,8 +133,8 @@ local function get_dominant_foreground(seconds)
             end
             rec.last_ns = entry.end_ns
             -- The history is chronological, so this ends up holding the LATEST
-            -- sample of this app/window -- i.e. its most recent fullscreen
-            -- state, which is what decides Desktop vs. game folder.
+            -- sample of this app -- i.e. its most recent window title and
+            -- fullscreen state, which is what decides Desktop vs. game folder.
             rec.info = entry
             rec.duration_ns = rec.duration_ns + (e - s)
         end
@@ -627,6 +634,7 @@ end
             obs.timer_remove(retry)
         end
         pending_move_timers = {}
+        if Sorter.cancel_steam_queue then Sorter.cancel_steam_queue() end
     end
 
     function Sorter.script_update(settings)

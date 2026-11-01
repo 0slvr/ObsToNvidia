@@ -48,6 +48,23 @@ local function each_module(hook, ...)
     end
 end
 
+-- OBS only shows a description when the script defines a GLOBAL
+-- script_description(); the per-module ones (Sorter/Alert/Updater) were never
+-- called. Joins them in the same order as the groups in the Scripts window.
+function script_description()
+    local parts = {
+        "<h3>1) Replay Buffer Restarter</h3><p>Restarts the Replay Buffer after every " ..
+        "save so back-to-back clips never share overlapping footage.</p>",
+    }
+    for _, m in ipairs({ { "Sorter", Sorter }, { "Alert", Alert }, { "Updater", Updater } }) do
+        if m[2].script_description then
+            local ok, text = pcall(m[2].script_description)
+            if ok and type(text) == "string" then parts[#parts + 1] = text end
+        end
+    end
+    return table.concat(parts, "\n")
+end
+
 function script_defaults(settings) each_module("script_defaults", settings) end
 function script_update(settings) each_module("script_update", settings) end
 
@@ -75,7 +92,7 @@ local function process_is_running(pid)
     if h == nil then
         -- Access denied (5) means it exists but belongs to a higher-privilege
         -- process (e.g. OBS run as admin): still running. Anything else: gone.
-        return kernel32.GetLastError() == 5
+        return C.last_error() == 5
     end
     local r = kernel32.WaitForSingleObject(h, 0)
     kernel32.CloseHandle(h)

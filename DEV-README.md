@@ -44,3 +44,12 @@ To get a confirmation again, remove `--yes` from `Properties\launchSettings.json
 - This folder must be a git clone of the repo `0slvr/ObsToNvidia` (the Update Checker is set to that repo):
   `git clone https://github.com/0slvr/ObsToNvidia.git`, then copy this project's files into the clone and open the `.sln` from there.
   (Or in this folder: `git init`, `git remote add origin https://github.com/0slvr/ObsToNvidia.git`, `git pull origin main --allow-unrelated-histories`.)
+
+## Tests
+
+`tests\run_tests.lua` runs the real parts from `src\` against a fake OBS (virtual clock + timers) and a fake WinHTTP,
+so the Restarter timing, the foreground-app choice and the Steam lookup can be checked without OBS or Windows:
+
+    luajit tests/run_tests.lua          (any Lua 5.1-5.4 works too)
+
+Run it before **Publish Release**. It exits with a non-zero code if a check fails.

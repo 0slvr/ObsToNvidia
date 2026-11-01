@@ -284,7 +284,7 @@ do
         local moved = kernel32.MoveFileExW(utf8_to_wide(tmp_path), utf8_to_wide(path),
             C.MOVEFILE_REPLACE_EXISTING + C.MOVEFILE_WRITE_THROUGH)
         if moved == 0 then
-            local err = kernel32.GetLastError()
+            local err = C.last_error()
             W.remove(tmp_path)
             return false, "couldn't replace the script file (Windows error " .. tostring(err) ..
                 ") -- your current script was not touched"

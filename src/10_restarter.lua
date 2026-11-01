@@ -267,6 +267,13 @@ do
             -- A save has begun (OBS 30.2+; on older versions this event doesn't
             -- exist and the module simply relies on the quiet period).
             local t = now()
+            -- A SAVING that never got its SAVED (failed save) leaves pending_saves
+            -- stuck above 0. Once it is stale it must not be counted on top of the
+            -- new save, or the next restart waits ~STALE_MS for a SAVED that
+            -- never comes (clips of two saves would overlap in that time).
+            if pending_saves > 0 and t - last_saving_at > STALE_MS then
+                pending_saves = 0
+            end
             if pending_saves > 0 and t - last_saving_at <= STALE_MS then
                 -- OBS writes one clip at a time and ignores save presses (key held,
                 -- double press) while one is being written -- yet still announces each
