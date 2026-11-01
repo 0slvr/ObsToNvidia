@@ -125,14 +125,28 @@ local function resume_replay_buffer_after_relaunch(marker)
             if Updater.has_staged_update() then
                 local ok, err = Updater.apply_staged_update()
                 if ok then
-                    obs.script_log(obs.LOG_INFO, "OBS Clip Suite: update applied -- reloading the script.")
-                    state = "applied" -- OBS reloads the script; this copy normally never runs again
+                    -- OBS does not reload a script that changed on disk, so restart
+                    -- once more: a third OBS loads the new file, waits for THIS one to
+                    -- exit (the marker now holds this PID) and resumes the buffer.
+                    obs.script_log(obs.LOG_INFO, "OBS Clip Suite: update applied -- restarting OBS once more to load it.")
+                    local rok, rerr = Updater.relaunch_obs(marker.resume)
+                    if rok then
+                        dormant_old_instance = true -- this OBS is closing: stay passive
+                        Restarter.abort()
+                        state = "relaunching"
+                        return
+                    end
+                    obs.script_log(obs.LOG_WARNING,
+                        "OBS Clip Suite: couldn't restart OBS again (" .. tostring(rerr) .. ").")
+                    state = "applied" -- fall back: keep running, resume the buffer
                     return
                 end
                 obs.script_log(obs.LOG_WARNING,
                     "OBS Clip Suite: couldn't apply the staged update (" .. tostring(err) .. ").")
             end
             return begin_resume()
+        elseif state == "relaunching" then
+            return -- the next OBS takes over; nothing to do here
         elseif state == "applied" then
             -- OBS didn't reload us: carry on with what is in memory rather than leave the buffer off.
             applied_s = applied_s + 1

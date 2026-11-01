@@ -193,6 +193,12 @@
         return true
     end
 
+    -- Used by the NEW OBS (see 90_main.lua) to restart once more after it swapped
+    -- the file in, because OBS doesn't reload a script that changed on disk.
+    function Updater.relaunch_obs(resume)
+        return relaunch_obs(resume)
+    end
+
     -- Writes the downloaded script NEXT TO the live one as "<script>.staged"
     -- (verified by reading it back). The live file is NOT touched, so this
     -- OBS never reloads the script in the middle of an update.
