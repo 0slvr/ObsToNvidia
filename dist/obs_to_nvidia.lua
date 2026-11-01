@@ -7,7 +7,7 @@ GitHub Releases. Each module has its own group and on/off checkbox.
 --]]
 
 -- Bump on every GitHub Release (compared numerically: 1.10.0 > 1.9.0).
-local VERSION = "2.23"
+local VERSION = "2.24"
 
 obs = obslua
 
@@ -6294,8 +6294,9 @@ end
 local function resume_replay_buffer_after_relaunch(marker)
     local MAX_WAIT_S = 180   -- the old OBS may be sitting on a "quit?" prompt
     local MAX_RETRIES = 8
-    local state = "waiting"  -- "waiting" -> "applied" -> "starting"
+    local state = "waiting"  -- "waiting" -> "relaunch_wait" -> "relaunching" (or "applied" -> "starting")
     local waited_s, applied_s, retries, warned = 0, 0, 0, false
+    local relaunch_tries = 0
     local tick
 
     local function stop() obs.timer_remove(tick) end
@@ -6337,22 +6338,34 @@ local function resume_replay_buffer_after_relaunch(marker)
                     -- once more: a third OBS loads the new file, waits for THIS one to
                     -- exit (the marker now holds this PID) and resumes the buffer.
                     obs.script_log(obs.LOG_INFO, "OBS Clip Suite: update applied -- restarting OBS once more to load it.")
-                    local rok, rerr = Updater.relaunch_obs(marker.resume)
-                    if rok then
-                        dormant_old_instance = true -- this OBS is closing: stay passive
-                        Restarter.abort()
-                        state = "relaunching"
-                        return
-                    end
-                    obs.script_log(obs.LOG_WARNING,
-                        "OBS Clip Suite: couldn't restart OBS again (" .. tostring(rerr) .. ").")
-                    state = "applied" -- fall back: keep running, resume the buffer
+                    state = "relaunch_wait"
+                    relaunch_tries = 0
                     return
                 end
                 obs.script_log(obs.LOG_WARNING,
                     "OBS Clip Suite: couldn't apply the staged update (" .. tostring(err) .. ").")
             end
             return begin_resume()
+        elseif state == "relaunch_wait" then
+            -- This OBS is still starting up: its main window may not exist yet, so
+            -- "couldn't find OBS's own main window" is normal for the first seconds.
+            -- Keep trying (up to ~60 s) instead of giving up and leaving two OBS running.
+            local rok, rerr = Updater.relaunch_obs(marker.resume)
+            if rok then
+                dormant_old_instance = true -- this OBS is closing: stay passive
+                Restarter.abort()
+                state = "relaunching"
+                return
+            end
+            relaunch_tries = relaunch_tries + 1
+            local transient = tostring(rerr):find("main window", 1, true) ~= nil
+            if transient and relaunch_tries < 60 then
+                return
+            end
+            obs.script_log(obs.LOG_WARNING,
+                "OBS Clip Suite: couldn't restart OBS again (" .. tostring(rerr) .. ").")
+            state = "applied" -- fall back: keep running, resume the buffer
+            return
         elseif state == "relaunching" then
             return -- the next OBS takes over; nothing to do here
         elseif state == "applied" then
