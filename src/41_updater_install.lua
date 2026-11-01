@@ -216,8 +216,8 @@
     end
 
     -- Swaps the staged file in (backup + atomic replace, same as before).
-    -- Called by the NEW OBS, after the old one has exited -- so the reload
-    -- OBS does after the swap is an ordinary clean one.
+    -- Called by the NEW OBS, after the old one has exited. OBS won't reload the
+    -- script by itself after the swap, so the caller restarts OBS once more.
     function Updater.has_staged_update()
         local path = read_own_script()
         return path ~= nil and W.exists(path .. ".staged")
@@ -259,11 +259,12 @@
         if not relaunch_ok then
             remove_update_marker()
             -- No relaunch is in flight, so swapping the file here is safe:
-            -- it just reloads the script in this OBS, like the reload button.
+            -- the new file is on disk but this OBS keeps running the old code
+            -- until it is restarted (OBS doesn't reload changed scripts itself).
             local applied, apply_err = Updater.apply_staged_update()
             if applied then
                 last_check_result = "Update installed, but couldn't restart OBS automatically (" ..
-                    tostring(relaunch_err) .. ") -- the script was reloaded in this OBS; restart OBS when convenient."
+                    tostring(relaunch_err) .. ") -- the new version loads after you restart OBS."
             else
                 W.remove(path .. ".staged")
                 last_check_result = "Couldn't install the update (" .. tostring(apply_err) .. ")."

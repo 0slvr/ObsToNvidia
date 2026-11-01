@@ -75,7 +75,8 @@ Off by default. Turn it on with the group's checkbox, then choose:
   - *Install it automatically* – installs when no stream / recording / virtual camera is active and no fullscreen game is in front (the Replay Buffer doesn't block it: it is stopped first and started again by the new OBS).
   - *Only mention it in the log*.
 - The dialog and installs are held back while a fullscreen game is in the foreground. The dialog is also held back while a stream / recording / virtual camera is active, and only one dialog can be open at a time.
-- **Restore previous version** puts the newer version on the skipped list, so it isn't offered again right after the restore. Versions older than 2.15 are swapped in place without restarting OBS.
+- An update restarts OBS twice (it opens and closes twice): the second restart is what loads the new version. The Replay Buffer is resumed at the end.
+- **Restore previous version** puts the newer version on the skipped list, so it isn't offered again right after the restore.
 - Your old script is backed up next to it as `obs_to_nvidia.lua.bak` and `obs_to_nvidia.lua.bak-<version>`. **Restore previous version** brings it back.
 - **How an update is applied (2.4.2+):** the new file is written next to the script as `obs_to_nvidia.lua.staged`. OBS then starts a fresh instance, the old one closes, and the *new* instance swaps the file in and starts the Replay Buffer again – once. The running script file is never overwritten while OBS is using it.
 

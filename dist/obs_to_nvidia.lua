@@ -7,7 +7,7 @@ GitHub Releases. Each module has its own group and on/off checkbox.
 --]]
 
 -- Bump on every GitHub Release (compared numerically: 1.10.0 > 1.9.0).
-local VERSION = "2.18"
+local VERSION = "2.19"
 
 obs = obslua
 
@@ -4672,10 +4672,10 @@ end
 -- exists to avoid. (The Replay Buffer does NOT hold it back: the installer
 -- stops it first and the new OBS starts it again.)
 --
--- Either way, OBS keeps whatever version it already loaded into memory
--- running until you reload this script or restart OBS -- there's no API
--- available to a script for hot-reloading itself, so that one manual step
--- can never be fully eliminated.
+-- OBS does NOT reload a script whose file changed on disk, and there is no
+-- API for a script to hot-reload itself. So after an install the new OBS
+-- swaps the file in and then restarts ONE MORE time (see 90_main.lua) so the
+-- new version is really the one running -- nothing for the user to do by hand.
 local Updater = {}
 do
     -- GitHub gives every repo a permanent "latest release" alias URL
@@ -4706,11 +4706,6 @@ do
     local SCRIPT_DL_TIMEOUTS = { resolve = 2000, connect = 2000, send = 2000, receive = 6000, total = 10000 }
     local VERSION_PROBE_TIMEOUTS = { resolve = 1500, connect = 1500, send = 1500, receive = 2500,
         total = 4000, headers = "Range: bytes=0-4095\r\n" }
-
-    -- First version that understands the new restart protocol ("the new OBS waits
-    -- for the old one to exit before resuming the Replay Buffer"). Older versions
-    -- don't, so restoring one of those must NOT go through the relaunch path.
-    local WAIT_PROTOCOL_VERSION = "2.15"
 
     local check_on_load = true
     -- "ask" (default) shows a dialog and does nothing without an answer,
@@ -5181,8 +5176,8 @@ do
     end
 
     -- Swaps the staged file in (backup + atomic replace, same as before).
-    -- Called by the NEW OBS, after the old one has exited -- so the reload
-    -- OBS does after the swap is an ordinary clean one.
+    -- Called by the NEW OBS, after the old one has exited. OBS won't reload the
+    -- script by itself after the swap, so the caller restarts OBS once more.
     function Updater.has_staged_update()
         local path = read_own_script()
         return path ~= nil and W.exists(path .. ".staged")
@@ -5224,11 +5219,12 @@ do
         if not relaunch_ok then
             remove_update_marker()
             -- No relaunch is in flight, so swapping the file here is safe:
-            -- it just reloads the script in this OBS, like the reload button.
+            -- the new file is on disk but this OBS keeps running the old code
+            -- until it is restarted (OBS doesn't reload changed scripts itself).
             local applied, apply_err = Updater.apply_staged_update()
             if applied then
                 last_check_result = "Update installed, but couldn't restart OBS automatically (" ..
-                    tostring(relaunch_err) .. ") -- the script was reloaded in this OBS; restart OBS when convenient."
+                    tostring(relaunch_err) .. ") -- the new version loads after you restart OBS."
             else
                 W.remove(path .. ".staged")
                 last_check_result = "Couldn't install the update (" .. tostring(apply_err) .. ")."
@@ -5686,30 +5682,21 @@ do
             return
         end
         local backup_version = extract_version(backup_content) or "previous"
-        -- Restoring to something OLDER than WAIT_PROTOCOL_VERSION: that version
-        -- doesn't know the "wait for the old OBS to exit" restart, so a relaunch
-        -- would make two OBS instances fight over the Replay Buffer. For those,
-        -- the file is swapped in place and OBS reloads the script by itself.
-        local old_protocol = backup_version ~= "previous"
-            and compare_versions(backup_version, WAIT_PROTOCOL_VERSION) < 0
-        local message
-        if old_protocol then
-            message = "Restore OBS Clip Suite version " .. backup_version .. " (you are on " .. VERSION .. ")?\n\n" ..
-                "This is an older version, so OBS is NOT restarted: the file is\n" ..
-                "replaced and the script reloads by itself (restart OBS yourself\n" ..
-                "if it doesn't).\n\n" ..
-                "Yes  -  Restore it\n" ..
-                "No / Cancel  -  Do nothing"
-        else
-            message = "Restore OBS Clip Suite version " .. backup_version .. " (you are on " .. VERSION .. ")?\n\n" ..
-                "Yes  -  Restore it and restart OBS now (the Replay Buffer is stopped and resumed)\n" ..
-                "No / Cancel  -  Do nothing"
-        end
+        -- Every restore goes through the normal install path, whatever version it
+        -- restores: OBS stops the Replay Buffer first, the next OBS swaps the file
+        -- in and restarts once more, so the restored version is the one running
+        -- and nobody has to restart OBS by hand. (The buffer is already off while
+        -- the OBS instances hand over, so even an old version that doesn't wait
+        -- for the previous OBS can't record twice.)
         if Updater.prompt_open then
             return
         end
         Updater.prompt_open = true
-        local ask_ok, answer = pcall(Sorter.ask_yes_no_cancel, message, "OBS Clip Suite - restore previous version")
+        local ask_ok, answer = pcall(Sorter.ask_yes_no_cancel,
+            "Restore OBS Clip Suite version " .. backup_version .. " (you are on " .. VERSION .. ")?\n\n" ..
+            "Yes  -  Restore it and restart OBS now (the Replay Buffer is stopped and resumed)\n" ..
+            "No / Cancel  -  Do nothing",
+            "OBS Clip Suite - restore previous version")
         Updater.prompt_open = false
         if not ask_ok or answer ~= Sorter.MB_IDYES then
             return
@@ -5721,21 +5708,6 @@ do
         -- newer release is offered normally; "Un-skip" undoes this.)
         if compare_versions(VERSION, backup_version) > 0 then
             remember_skipped(VERSION)
-        end
-
-        if old_protocol then
-            local ok, err = write_updated_script(own_path, backup_content)
-            if ok then
-                if err and updater_settings ~= nil then
-                    obs.obs_data_set_string(updater_settings, "last_backup_path", err)
-                end
-                last_check_result = "Restored version " .. backup_version .. " -- the script is reloading " ..
-                    "(restart OBS if it doesn't)."
-            else
-                last_check_result = "Couldn't restore the previous version (" .. tostring(err) .. ")."
-            end
-            obs.script_log(obs.LOG_WARNING, "OBS Clip Suite: " .. last_check_result)
-            return
         end
 
         pending_update = { path = own_path, content = backup_content, version = backup_version }
@@ -5913,7 +5885,7 @@ end
 function script_defaults(settings) each_module("script_defaults", settings) end
 function script_update(settings) each_module("script_update", settings) end
 
--- True in the OLD OBS after a self-update reloaded the script: stay passive.
+-- True in an OBS that is closing because of a self-update: stay passive.
 local dormant_old_instance = false
 
 local function on_frontend_event(event)
@@ -5943,8 +5915,9 @@ local function process_is_running(pid)
 end
 
 -- New instance launched by a self-update: WAIT until the old OBS has really
--- exited, then (1) swap in the staged script, if any -- OBS reloads it and the
--- reloaded copy lands back here -- and (2) start the Replay Buffer and confirm it.
+-- exited, then (1) swap in the staged script, if any, and restart OBS once more
+-- (OBS doesn't reload a changed script by itself); the last OBS lands back here
+-- with nothing staged and (2) starts the Replay Buffer and confirms it.
 local function resume_replay_buffer_after_relaunch(marker)
     local MAX_WAIT_S = 180   -- the old OBS may be sitting on a "quit?" prompt
     local MAX_RETRIES = 8
@@ -6010,11 +5983,11 @@ local function resume_replay_buffer_after_relaunch(marker)
         elseif state == "relaunching" then
             return -- the next OBS takes over; nothing to do here
         elseif state == "applied" then
-            -- OBS didn't reload us: carry on with what is in memory rather than leave the buffer off.
+            -- The extra restart failed: carry on with what is in memory rather than leave the buffer off.
             applied_s = applied_s + 1
             if applied_s >= 5 then
                 obs.script_log(obs.LOG_WARNING,
-                    "OBS Clip Suite: OBS didn't reload the script by itself -- restart OBS to use the new version.")
+                    "OBS Clip Suite: the update is installed but OBS wasn't restarted -- restart OBS to use the new version.")
                 begin_resume()
             end
             return

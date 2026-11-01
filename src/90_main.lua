@@ -51,7 +51,7 @@ end
 function script_defaults(settings) each_module("script_defaults", settings) end
 function script_update(settings) each_module("script_update", settings) end
 
--- True in the OLD OBS after a self-update reloaded the script: stay passive.
+-- True in an OBS that is closing because of a self-update: stay passive.
 local dormant_old_instance = false
 
 local function on_frontend_event(event)
@@ -81,8 +81,9 @@ local function process_is_running(pid)
 end
 
 -- New instance launched by a self-update: WAIT until the old OBS has really
--- exited, then (1) swap in the staged script, if any -- OBS reloads it and the
--- reloaded copy lands back here -- and (2) start the Replay Buffer and confirm it.
+-- exited, then (1) swap in the staged script, if any, and restart OBS once more
+-- (OBS doesn't reload a changed script by itself); the last OBS lands back here
+-- with nothing staged and (2) starts the Replay Buffer and confirms it.
 local function resume_replay_buffer_after_relaunch(marker)
     local MAX_WAIT_S = 180   -- the old OBS may be sitting on a "quit?" prompt
     local MAX_RETRIES = 8
@@ -148,11 +149,11 @@ local function resume_replay_buffer_after_relaunch(marker)
         elseif state == "relaunching" then
             return -- the next OBS takes over; nothing to do here
         elseif state == "applied" then
-            -- OBS didn't reload us: carry on with what is in memory rather than leave the buffer off.
+            -- The extra restart failed: carry on with what is in memory rather than leave the buffer off.
             applied_s = applied_s + 1
             if applied_s >= 5 then
                 obs.script_log(obs.LOG_WARNING,
-                    "OBS Clip Suite: OBS didn't reload the script by itself -- restart OBS to use the new version.")
+                    "OBS Clip Suite: the update is installed but OBS wasn't restarted -- restart OBS to use the new version.")
                 begin_resume()
             end
             return

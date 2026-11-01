@@ -23,10 +23,10 @@
 -- exists to avoid. (The Replay Buffer does NOT hold it back: the installer
 -- stops it first and the new OBS starts it again.)
 --
--- Either way, OBS keeps whatever version it already loaded into memory
--- running until you reload this script or restart OBS -- there's no API
--- available to a script for hot-reloading itself, so that one manual step
--- can never be fully eliminated.
+-- OBS does NOT reload a script whose file changed on disk, and there is no
+-- API for a script to hot-reload itself. So after an install the new OBS
+-- swaps the file in and then restarts ONE MORE time (see 90_main.lua) so the
+-- new version is really the one running -- nothing for the user to do by hand.
 local Updater = {}
 do
     -- GitHub gives every repo a permanent "latest release" alias URL
@@ -57,11 +57,6 @@ do
     local SCRIPT_DL_TIMEOUTS = { resolve = 2000, connect = 2000, send = 2000, receive = 6000, total = 10000 }
     local VERSION_PROBE_TIMEOUTS = { resolve = 1500, connect = 1500, send = 1500, receive = 2500,
         total = 4000, headers = "Range: bytes=0-4095\r\n" }
-
-    -- First version that understands the new restart protocol ("the new OBS waits
-    -- for the old one to exit before resuming the Replay Buffer"). Older versions
-    -- don't, so restoring one of those must NOT go through the relaunch path.
-    local WAIT_PROTOCOL_VERSION = "2.15"
 
     local check_on_load = true
     -- "ask" (default) shows a dialog and does nothing without an answer,

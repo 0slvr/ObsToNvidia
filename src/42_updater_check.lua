@@ -210,30 +210,21 @@
             return
         end
         local backup_version = extract_version(backup_content) or "previous"
-        -- Restoring to something OLDER than WAIT_PROTOCOL_VERSION: that version
-        -- doesn't know the "wait for the old OBS to exit" restart, so a relaunch
-        -- would make two OBS instances fight over the Replay Buffer. For those,
-        -- the file is swapped in place and OBS reloads the script by itself.
-        local old_protocol = backup_version ~= "previous"
-            and compare_versions(backup_version, WAIT_PROTOCOL_VERSION) < 0
-        local message
-        if old_protocol then
-            message = "Restore OBS Clip Suite version " .. backup_version .. " (you are on " .. VERSION .. ")?\n\n" ..
-                "This is an older version, so OBS is NOT restarted: the file is\n" ..
-                "replaced and the script reloads by itself (restart OBS yourself\n" ..
-                "if it doesn't).\n\n" ..
-                "Yes  -  Restore it\n" ..
-                "No / Cancel  -  Do nothing"
-        else
-            message = "Restore OBS Clip Suite version " .. backup_version .. " (you are on " .. VERSION .. ")?\n\n" ..
-                "Yes  -  Restore it and restart OBS now (the Replay Buffer is stopped and resumed)\n" ..
-                "No / Cancel  -  Do nothing"
-        end
+        -- Every restore goes through the normal install path, whatever version it
+        -- restores: OBS stops the Replay Buffer first, the next OBS swaps the file
+        -- in and restarts once more, so the restored version is the one running
+        -- and nobody has to restart OBS by hand. (The buffer is already off while
+        -- the OBS instances hand over, so even an old version that doesn't wait
+        -- for the previous OBS can't record twice.)
         if Updater.prompt_open then
             return
         end
         Updater.prompt_open = true
-        local ask_ok, answer = pcall(Sorter.ask_yes_no_cancel, message, "OBS Clip Suite - restore previous version")
+        local ask_ok, answer = pcall(Sorter.ask_yes_no_cancel,
+            "Restore OBS Clip Suite version " .. backup_version .. " (you are on " .. VERSION .. ")?\n\n" ..
+            "Yes  -  Restore it and restart OBS now (the Replay Buffer is stopped and resumed)\n" ..
+            "No / Cancel  -  Do nothing",
+            "OBS Clip Suite - restore previous version")
         Updater.prompt_open = false
         if not ask_ok or answer ~= Sorter.MB_IDYES then
             return
@@ -245,21 +236,6 @@
         -- newer release is offered normally; "Un-skip" undoes this.)
         if compare_versions(VERSION, backup_version) > 0 then
             remember_skipped(VERSION)
-        end
-
-        if old_protocol then
-            local ok, err = write_updated_script(own_path, backup_content)
-            if ok then
-                if err and updater_settings ~= nil then
-                    obs.obs_data_set_string(updater_settings, "last_backup_path", err)
-                end
-                last_check_result = "Restored version " .. backup_version .. " -- the script is reloading " ..
-                    "(restart OBS if it doesn't)."
-            else
-                last_check_result = "Couldn't restore the previous version (" .. tostring(err) .. ")."
-            end
-            obs.script_log(obs.LOG_WARNING, "OBS Clip Suite: " .. last_check_result)
-            return
         end
 
         pending_update = { path = own_path, content = backup_content, version = backup_version }
