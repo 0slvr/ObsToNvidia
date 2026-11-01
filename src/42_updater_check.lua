@@ -283,9 +283,9 @@
         -- wants it.
         local mode = obs.obs_properties_add_list(props, "update_mode",
             "When an update is found", obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_STRING)
-        obs.obs_property_list_add_string(mode, "Ask me first (recommended)", "ask")
-        obs.obs_property_list_add_string(mode, "Install it automatically", "auto")
-        obs.obs_property_list_add_string(mode, "Only mention it in the log", "notify")
+        obs.obs_property_list_add_string(mode, "On update: ask me first (recommended)", "ask")
+        obs.obs_property_list_add_string(mode, "On update: install it automatically", "auto")
+        obs.obs_property_list_add_string(mode, "On update: only mention it in the log", "notify")
 
         -- Hidden: remembers which version was skipped via the dialog's
         -- "No" button, so the answer survives an OBS restart. Not something
@@ -295,22 +295,30 @@
             "Skipped version", obs.OBS_TEXT_DEFAULT)
         obs.obs_property_set_visible(skipped, false)
 
-        obs.obs_properties_add_button(props, "clear_skipped_btn", "Un-skip the version I skipped",
-            function()
-                if updater_settings ~= nil then
-                    obs.obs_data_set_string(updater_settings, "skipped_update_version", "")
-                end
-                skipped_version = ""
-                last_check_result = "Skipped version cleared -- it will be offered again on the next check."
-                obs.script_log(obs.LOG_INFO, "OBS Clip Suite: " .. last_check_result)
-                return true
-            end)
+        -- Only shown while a version is actually skipped (saves a row otherwise).
+        if skipped_version ~= "" then
+            obs.obs_properties_add_button(props, "clear_skipped_btn", "Un-skip the version I skipped",
+                function()
+                    if updater_settings ~= nil then
+                        obs.obs_data_set_string(updater_settings, "skipped_update_version", "")
+                    end
+                    skipped_version = ""
+                    last_check_result = "Skipped version cleared -- it will be offered again on the next check."
+                    obs.script_log(obs.LOG_INFO, "OBS Clip Suite: " .. last_check_result)
+                    return true
+                end)
+        end
 
-        obs.obs_properties_add_button(props, "restore_backup_btn", "Restore previous version",
-            function()
-                Updater.restore_previous_version()
-                return true
-            end)
+        -- Only shown once an update has left a backup to go back to (saves a row).
+        local has_backup = updater_settings == nil or
+            (obs.obs_data_get_string(updater_settings, "last_backup_path") or "") ~= ""
+        if has_backup then
+            obs.obs_properties_add_button(props, "restore_backup_btn", "Restore previous version",
+                function()
+                    Updater.restore_previous_version()
+                    return true
+                end)
+        end
 
         obs.obs_properties_add_button(props, "check_updates_btn", "Check for Updates Now",
             function()

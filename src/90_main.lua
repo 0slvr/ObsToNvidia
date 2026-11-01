@@ -12,61 +12,107 @@ local function guard(what, fn, ...)
     return ok
 end
 
+-- Last settings OBS gave us; used to decide which rows to show when the
+-- window is built (OBS calls script_properties() without them).
+local ui_settings = nil
+
+-- Rows that only make sense while their feature's checkbox is on.
+local SORTER_ROWS = { "steam_lookup_enabled", "new_rename", "add_mapping_btn" }
+local ALERT_ROWS = { "clip_toast", "selected_sound_id", "custom_sound_path", "alert_volume", "test_alert_button" }
+
+-- "fallbacks" are the section objects: used if the property isn't found from
+-- the top level.
+local function set_rows_visible(props, fallbacks, names, visible)
+    for _, name in ipairs(names) do
+        local prop = obs.obs_properties_get(props, name)
+        if prop == nil then
+            for _, grp in ipairs(fallbacks) do
+                prop = obs.obs_properties_get(grp, name)
+                if prop ~= nil then break end
+            end
+        end
+        if prop ~= nil then
+            -- Hidden while the feature's checkbox is off.
+            obs.obs_property_set_visible(prop, visible)
+        end
+    end
+end
+
 function script_properties()
     local props = obs.obs_properties_create()
 
-    -- A checkable group's header checkbox is that module's on/off switch; its
-    -- key is the one the module reads back in its own script_update.
-    local restarter_group = obs.obs_properties_create()
-    obs.obs_properties_add_group(props, "restart_buffer_after_save",
-        "1) Replay Buffer Restarter", obs.OBS_GROUP_CHECKABLE, restarter_group)
+    -- Three separate sections (Clips, Alerts, Updates). A feature's own rows are
+    -- hidden while its checkbox is off. Each module's on/off switch is a plain
+    -- checkbox; the keys are the same ones the modules read in script_update.
+    local clips = obs.obs_properties_create()
+    local alerts = obs.obs_properties_create()
+    local updates = obs.obs_properties_create()
+    local sections = { clips, alerts, updates }
 
-    local sorter_group = obs.obs_properties_create()
-    guard("Sorter.script_properties", Sorter.script_properties, sorter_group)
-    obs.obs_properties_add_group(props, "sorter_enabled",
-        "2) Replay Organizer", obs.OBS_GROUP_CHECKABLE, sorter_group)
+    obs.obs_properties_add_bool(clips, "restart_buffer_after_save",
+        "Restart the Replay Buffer after every save")
+    local sort_cb = obs.obs_properties_add_bool(clips, "sorter_enabled",
+        "Sort clips into a folder per game")
+    guard("Sorter.script_properties", Sorter.script_properties, clips)
 
-    local alert_group = obs.obs_properties_create()
-    guard("Alert.script_properties", Alert.script_properties, alert_group)
-    obs.obs_properties_add_group(props, "alert_sound",
-        "3) Clip Alert Sound", obs.OBS_GROUP_CHECKABLE, alert_group)
+    local alert_cb = obs.obs_properties_add_bool(alerts, "alert_sound",
+        "Play a sound when a clip is saved")
+    guard("Toast.script_properties", Toast.script_properties, alerts)   -- right under the sound checkbox
+    guard("Alert.script_properties", Alert.script_properties, alerts)
 
-    -- Not checkable: it has its own "check automatically" checkbox inside.
-    local updater_group = obs.obs_properties_create()
-    guard("Updater.script_properties", Updater.script_properties, updater_group)
-    obs.obs_properties_add_group(props, "updater_group",
-        "4) Update Checker", obs.OBS_GROUP_NORMAL, updater_group)
+    guard("Updater.script_properties", Updater.script_properties, updates)
 
+    -- Drop the text labels on the left (they push every checkbox to the right
+    -- and clutter the window). What each row is stays clear from its content.
+    local function relabel(section, name, text)
+        local prop = obs.obs_properties_get(section, name)
+        if prop ~= nil then obs.obs_property_set_description(prop, text) end
+    end
+    relabel(clips, "new_rename", "")
+    relabel(clips, "add_mapping_btn", "Add rename  (type: old folder name = new name)")
+    relabel(alerts, "selected_sound_id", "")
+    relabel(alerts, "custom_sound_path", "")
+    relabel(alerts, "alert_volume", "")
+    relabel(updates, "update_mode", "")
+    local vol = obs.obs_properties_get(alerts, "alert_volume")
+    if vol ~= nil then obs.obs_property_float_set_suffix(vol, "% volume") end
+
+    obs.obs_property_set_modified_callback(sort_cb, function(p, _prop, settings)
+        pcall(set_rows_visible, p, sections, SORTER_ROWS, obs.obs_data_get_bool(settings, "sorter_enabled"))
+        return true
+    end)
+    obs.obs_property_set_modified_callback(alert_cb, function(p, _prop, settings)
+        pcall(set_rows_visible, p, sections, ALERT_ROWS, obs.obs_data_get_bool(settings, "alert_sound"))
+        return true
+    end)
+
+    if ui_settings ~= nil then
+        pcall(set_rows_visible, clips, sections, SORTER_ROWS, obs.obs_data_get_bool(ui_settings, "sorter_enabled"))
+        pcall(set_rows_visible, alerts, sections, ALERT_ROWS, obs.obs_data_get_bool(ui_settings, "alert_sound"))
+    end
+
+    obs.obs_properties_add_group(props, "clips_group", "Clips", obs.OBS_GROUP_NORMAL, clips)
+    obs.obs_properties_add_group(props, "alerts_group", "Alerts", obs.OBS_GROUP_NORMAL, alerts)
+    obs.obs_properties_add_group(props, "updates_group", "Updates", obs.OBS_GROUP_NORMAL, updates)
     return props
 end
 
 -- Runs a lifecycle hook on every module, in this order, each under guard().
-local MODULES = { { "Restarter", Restarter }, { "Alert", Alert }, { "Sorter", Sorter }, { "Updater", Updater } }
+local MODULES = { { "Restarter", Restarter }, { "Alert", Alert }, { "Sorter", Sorter }, { "Updater", Updater }, { "Toast", Toast } }
 local function each_module(hook, ...)
     for _, m in ipairs(MODULES) do
         if m[2][hook] then guard(m[1] .. "." .. hook, m[2][hook], ...) end
     end
 end
 
--- OBS only shows a description when the script defines a GLOBAL
--- script_description(); the per-module ones (Sorter/Alert/Updater) were never
--- called. Joins them in the same order as the groups in the Scripts window.
-function script_description()
-    local parts = {
-        "<h3>1) Replay Buffer Restarter</h3><p>Restarts the Replay Buffer after every " ..
-        "save so back-to-back clips never share overlapping footage.</p>",
-    }
-    for _, m in ipairs({ { "Sorter", Sorter }, { "Alert", Alert }, { "Updater", Updater } }) do
-        if m[2].script_description then
-            local ok, text = pcall(m[2].script_description)
-            if ok and type(text) == "string" then parts[#parts + 1] = text end
-        end
-    end
-    return table.concat(parts, "\n")
-end
+-- No global script_description() on purpose: the Scripts window shows no
+-- description text above the settings groups.
 
 function script_defaults(settings) each_module("script_defaults", settings) end
-function script_update(settings) each_module("script_update", settings) end
+function script_update(settings)
+    ui_settings = settings
+    each_module("script_update", settings)
+end
 
 -- True in an OBS that is closing because of a self-update: stay passive.
 local dormant_old_instance = false
@@ -77,6 +123,7 @@ local function on_frontend_event(event)
         -- Order matters: play the sound FIRST (it checks the clip is on disk at its
         -- original path, and must not wait for the Organizer, whose first-time Steam
         -- lookup can take seconds), then move the clip, then restart the buffer.
+        guard("Toast.on_replay_saved", Toast.on_replay_saved)
         guard("Alert.on_replay_saved", Alert.on_replay_saved)
         guard("Sorter.on_replay_saved", Sorter.on_replay_saved)
         guard("Restarter.on_replay_saved", Restarter.on_replay_saved)

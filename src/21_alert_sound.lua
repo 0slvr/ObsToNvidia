@@ -458,7 +458,7 @@ end
     local sound_list = obs.obs_properties_add_list(props, "selected_sound_id",
         "Alert sound", obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_STRING)
     for _, choice in ipairs(SOUND_CHOICES) do
-        obs.obs_property_list_add_string(sound_list, choice.label, choice.id)
+        obs.obs_property_list_add_string(sound_list, "Sound: " .. choice.label, choice.id)
     end
 
     obs.obs_properties_add_path(props, "custom_sound_path",
@@ -497,10 +497,10 @@ end
     end
 
     function Alert.script_defaults(settings)
-    obs.obs_data_set_default_bool(settings, "alert_sound", false)
+    obs.obs_data_set_default_bool(settings, "alert_sound", true)
     obs.obs_data_set_default_string(settings, "selected_sound_id", "new_notification")
     obs.obs_data_set_default_string(settings, "custom_sound_path", "")
-    obs.obs_data_set_default_double(settings, "alert_volume", 100)
+    obs.obs_data_set_default_double(settings, "alert_volume", 10)
     obs.obs_data_set_default_double(settings, "sound_channel_hold_s", 10)
     obs.obs_data_set_default_int(settings, "sound_channel", 63)
 end

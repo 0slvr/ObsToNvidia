@@ -11,4 +11,5 @@
 40_updater_core.lua
 41_updater_install.lua
 42_updater_check.lua
+50_clip_toast.lua
 90_main.lua

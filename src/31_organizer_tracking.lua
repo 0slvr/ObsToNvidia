@@ -515,11 +515,14 @@ local function add_mapping_clicked(props, property)
         return false
     end
 
-    local current_folder = obs.obs_data_get_string(current_settings, "new_raw"):match("^%s*(.-)%s*$")
-    local friendly = obs.obs_data_get_string(current_settings, "new_friendly"):match("^%s*(.-)%s*$")
+    -- One field, "current folder name = new name" (the "=" is pre-filled).
+    local entry = obs.obs_data_get_string(current_settings, "new_rename") or ""
+    local left, right = entry:match("^(.-)=(.*)$")
+    local current_folder = left and left:match("^%s*(.-)%s*$") or ""
+    local friendly = right and right:match("^%s*(.-)%s*$") or ""
 
     if current_folder == "" or friendly == "" then
-        print("OBS Replay Organizer: fill in both fields before adding.")
+        print("OBS Replay Organizer: type  current folder name = new name  before adding.")
         return false
     end
 
@@ -545,8 +548,7 @@ local function add_mapping_clicked(props, property)
     local updated = table.concat(kept, "\n")
 
     obs.obs_data_set_string(current_settings, "name_map", updated)
-    obs.obs_data_set_string(current_settings, "new_raw", "")
-    obs.obs_data_set_string(current_settings, "new_friendly", "")
+    obs.obs_data_set_string(current_settings, "new_rename", "=")
 
     name_map = parse_name_map(updated)
     rebuild_folder_index()
@@ -565,18 +567,17 @@ games on Steam.</p>
     end
 
     function Sorter.script_properties(props)
-        obs.obs_properties_add_text(
-            props, "new_raw",
-            "1) Current folder name",
-            obs.OBS_TEXT_DEFAULT
+        obs.obs_properties_add_bool(
+            props, "steam_lookup_enabled",
+            "Look up unknown games on Steam (online, last resort only)"
         )
         obs.obs_properties_add_text(
-            props, "new_friendly",
-            "2) New name",
+            props, "new_rename",
+            "Folder name = New name",
             obs.OBS_TEXT_DEFAULT
         )
         obs.obs_properties_add_button(
-            props, "add_mapping_btn", "3) Add",
+            props, "add_mapping_btn", "Add",
             add_mapping_clicked
         )
         -- Hidden on purpose: the Add button keeps this list up to date, and
@@ -603,14 +604,11 @@ games on Steam.</p>
         -- something most users will ever need to touch. Still has a real
         -- default and is still read normally in script_update below.
 
-        obs.obs_properties_add_bool(
-            props, "steam_lookup_enabled",
-            "Look up unknown games on Steam (online, last resort only)"
-        )
     end
 
     function Sorter.script_defaults(settings)
     obs.obs_data_set_default_bool(settings, "sorter_enabled", true)
+    obs.obs_data_set_default_string(settings, "new_rename", "=")
     obs.obs_data_set_default_double(settings, "lookback_s", 8)
     obs.obs_data_set_default_bool(settings, "steam_lookup_enabled", true)
 end
