@@ -7,7 +7,11 @@ GitHub Releases. Each module has its own group and on/off checkbox.
 --]]
 
 -- Bump on every GitHub Release (compared numerically: 1.10.0 > 1.9.0).
-local VERSION = "2.26"
+<<<<<<< HEAD
+local VERSION = "2.27"
+=======
+local VERSION = "2.27"
+>>>>>>> fd041e9 (Release v2.20)
 
 obs = obslua
 
@@ -2354,6 +2358,7 @@ end
 -- Puts the primed source on the output channel = plays it from the start,
 -- and (re)starts the poll that watches it.
 local function attach_alert()
+<<<<<<< HEAD
     -- A sound still on the channel from a previous save (rapid saves):
     -- do NOT detach + re-attach in the same tick. OBS handles the deactivate
     -- asynchronously, so "restart on activate" often never fires and the new
@@ -2367,6 +2372,11 @@ local function attach_alert()
         obs.timer_add(poll_alert, ALERT_POLL_MS)
         return
     end
+=======
+    -- A sound still playing from a previous save: take it off first so the
+    -- activation (and with it "restart on activate") happens again.
+    detach_alert()
+>>>>>>> fd041e9 (Release v2.20)
     obs.obs_set_output_source(SOUND_CHANNEL, alert_source)
     alert_attached = true
     alert_started_ns = obs.os_gettime_ns()
@@ -2386,10 +2396,13 @@ local function finish_alert()
 end
 
 poll_alert = function()
+<<<<<<< HEAD
     -- Runs from a 30 ms timer: an error here must never repeat 30x a second
     -- or leave the sound source stuck on the output channel.
     local ok, err = pcall(function()
 
+=======
+>>>>>>> fd041e9 (Release v2.20)
     if alert_source == nil or not alert_attached then
         obs.timer_remove(poll_alert)
         return
@@ -2406,6 +2419,7 @@ poll_alert = function()
             or state == obs.OBS_MEDIA_STATE_STOPPED then
             return finish_alert()
         end
+<<<<<<< HEAD
     elseif state == obs.OBS_MEDIA_STATE_ENDED
         and not alert_nudged
         and (obs.obs_source_media_get_duration(alert_source) or 0) > 0
@@ -2415,6 +2429,8 @@ poll_alert = function()
         -- Without this, the code below mistook it for "never started" and
         -- rebuilt + replayed it = the alert sounded twice.
         return finish_alert()
+=======
+>>>>>>> fd041e9 (Release v2.20)
     elseif state == obs.OBS_MEDIA_STATE_ERROR or elapsed_ms >= ALERT_REBUILD_MS then
         -- Never became audible: start over with a fresh source.
         alert_rebuilds = alert_rebuilds + 1
@@ -2436,12 +2452,15 @@ poll_alert = function()
     if elapsed_ms >= sound_channel_hold_ms then
         finish_alert()
     end
+<<<<<<< HEAD
     end)
     if not ok then
         obs.script_log(obs.LOG_ERROR, "Clip Alert: playback check failed: " .. tostring(err))
         obs.timer_remove(poll_alert)
         pcall(detach_alert)
     end
+=======
+>>>>>>> fd041e9 (Release v2.20)
 end
 
 local last_alert_ns = 0
@@ -2497,7 +2516,10 @@ end
 
 local function confirm_and_play()
     obs.timer_remove(confirm_and_play)
+<<<<<<< HEAD
     local ok, err = pcall(function()
+=======
+>>>>>>> fd041e9 (Release v2.20)
     local status, path = last_saved_status()
     if status == "missing" then
         -- Not on disk (yet): look again a few times before giving up.
@@ -2511,10 +2533,13 @@ local function confirm_and_play()
         return
     end
     do_sound_alert(false)
+<<<<<<< HEAD
     end)
     if not ok then
         obs.script_log(obs.LOG_ERROR, "Clip Alert: alert failed: " .. tostring(err))
     end
+=======
+>>>>>>> fd041e9 (Release v2.20)
 end
 
     local function trigger_alerts()
@@ -7034,7 +7059,10 @@ local function on_frontend_event(event)
         -- Order matters: play the sound FIRST (it checks the clip is on disk at its
         -- original path, and must not wait for the Organizer, whose first-time Steam
         -- lookup can take seconds), then move the clip, then restart the buffer.
+<<<<<<< HEAD
         guard("Toast.on_replay_saved", Toast.on_replay_saved)
+=======
+>>>>>>> fd041e9 (Release v2.20)
         guard("Alert.on_replay_saved", Alert.on_replay_saved)
         guard("Sorter.on_replay_saved", Sorter.on_replay_saved)
         guard("Restarter.on_replay_saved", Restarter.on_replay_saved)

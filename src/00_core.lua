@@ -7,7 +7,11 @@ GitHub Releases. Each module has its own group and on/off checkbox.
 --]]
 
 -- Bump on every GitHub Release (compared numerically: 1.10.0 > 1.9.0).
-local VERSION = "2.26"
+<<<<<<< HEAD
+local VERSION = "2.27"
+=======
+local VERSION = "2.27"
+>>>>>>> fd041e9 (Release v2.20)
 
 obs = obslua
 
