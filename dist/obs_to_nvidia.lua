@@ -7,7 +7,7 @@ GitHub Releases. Each module has its own group and on/off checkbox.
 --]]
 
 -- Bump on every GitHub Release (compared numerically: 1.10.0 > 1.9.0).
-local VERSION = "2.25"
+local VERSION = "2.26"
 
 obs = obslua
 
@@ -3386,7 +3386,9 @@ local steam_lookup_enabled = true
 local pending_move_timers = {}
 
 local FG_POLL_MS       = 500        -- how often we sample the foreground window
-local FG_HISTORY_MAX_S = 120        -- drop samples older than this (keeps the table small)
+-- Long enough to cover the whole Replay Buffer (up to 30 min) so that a clip saved from
+-- the desktop can still be traced back to the game that is in it (see get_recent_game).
+local FG_HISTORY_MAX_S = 1800       -- drop samples older than this (keeps the table small)
 local fg_history = {}               -- { {start_ns, end_ns, exe_name, window_title, is_fullscreen}, ... }
 
 local function fg_poll_tick()
@@ -3410,6 +3412,8 @@ local function fg_poll_tick()
     -- Lets the Steam-name code queue a background lookup for a brand-new game
     -- (defined further down; nothing here waits for the network).
     if Sorter.note_foreground then pcall(Sorter.note_foreground, info) end
+    -- Which games OBS Game Capture has hooked (throttled inside; see 32b).
+    if C.on and C.on.refresh_hooked then pcall(C.on.refresh_hooked) end
 
     local last = fg_history[#fg_history]
     -- Polling is skipped entirely whenever the Replay Buffer isn't running
@@ -3490,6 +3494,66 @@ local function get_dominant_foreground(seconds)
     for _, rec in pairs(totals) do
         if rec.duration_ns > best_ns or (rec.duration_ns == best_ns and rec.last_ns > best_last) then
             best, best_ns, best_last = rec.info, rec.duration_ns, rec.last_ns
+        end
+    end
+    return best
+end
+
+-- Length of the Replay Buffer in seconds, read from the active OBS profile
+-- (Simple or Advanced output mode). nil if it can't be read.
+local function replay_buffer_seconds()
+    local ok, secs = pcall(function()
+        local cfg = obs.obs_frontend_get_profile_config()
+        if cfg == nil then return nil end
+        local mode = obs.config_get_string(cfg, "Output", "Mode")
+        local section = (mode == "Advanced") and "AdvOut" or "SimpleOutput"
+        local v = tonumber(obs.config_get_int(cfg, section, "RecRBTime"))
+        if v and v > 0 then return v end
+        return nil
+    end)
+    if ok then return secs end
+    return nil
+end
+
+-- How far back to look for a game when the foreground at save time is NOT a game
+-- (you played, went to the desktop / Discord / browser, and then saved).
+-- At most ONE minute, and never longer than the Replay Buffer itself (a clip can't
+-- contain anything older than the buffer). Never less than 10 seconds.
+local function game_memory_seconds()
+    local w = math.min(replay_buffer_seconds() or 60, 60)
+    return math.max(w, 10)
+end
+
+-- Looks through the last `seconds` of history for a GAME (is_game(entry) decides)
+-- and returns the one that was in front MOST RECENTLY, as the latest history entry
+-- of that game -- or nil if there was none. A game only counts if it was in front for
+-- at least `min_s` seconds in total, so a flash of a window passing by is ignored.
+-- Playing A, then B, then going to the desktop -> B (the last game you played).
+local function get_recent_game(seconds, is_game, min_s)
+    local now = obs.os_gettime_ns()
+    local window_start = now - (seconds * 1e9)
+    local totals = {}
+    for _, entry in ipairs(fg_history) do
+        local s = math.max(entry.start_ns, window_start)
+        local e = math.min(entry.end_ns, now)
+        if e > s and entry.exe_name and is_game(entry) then
+            -- Protected (anti-cheat) games all share the placeholder exe name, so
+            -- they are told apart by their window title instead.
+            local key = entry.protected and ("?p:" .. tostring(entry.window_title)) or entry.exe_name:lower()
+            local rec = totals[key]
+            if not rec then
+                rec = { duration_ns = 0 }
+                totals[key] = rec
+            end
+            rec.info = entry        -- chronological: ends up as the LATEST game sample
+            rec.last_ns = entry.end_ns
+            rec.duration_ns = rec.duration_ns + (e - s)
+        end
+    end
+    local best, best_last = nil, -1
+    for _, rec in pairs(totals) do
+        if rec.duration_ns >= (min_s or 0) * 1e9 and rec.last_ns > best_last then
+            best, best_last = rec.info, rec.last_ns
         end
     end
     return best
@@ -3873,8 +3937,23 @@ local function add_mapping_clicked(props, property)
 
     local raw = last_seen_exe_by_folder[sanitize(current_folder):lower()]
     if raw == nil then
+        -- Not a folder name we know: maybe it's the program's own exe name (as Task
+        -- Manager shows it, e.g. "MyGame" or "MyGame.exe") of something that was in
+        -- front recently. This is how a game the script doesn't recognise (windowed,
+        -- installed in an unusual folder...) can be taught without a clip first.
+        local want = (current_folder:lower():gsub("%.exe$", ""))
+        for i = #fg_history, 1, -1 do
+            local e = fg_history[i]
+            if e.exe_name and not e.protected and e.exe_name:lower() == want then
+                raw = want
+                break
+            end
+        end
+    end
+    if raw == nil then
         print("OBS Replay Organizer: no clip has been sorted into a folder named '" ..
-              current_folder .. "' yet -- play that game and save one clip first, then try renaming it again.")
+              current_folder .. "' yet, and no program with that exe name was in front recently -- " ..
+              "play that game and save one clip first (or type its exe name as in Task Manager), then try again.")
         return false
     end
 
@@ -3912,6 +3991,10 @@ games on Steam.</p>
     end
 
     function Sorter.script_properties(props)
+        obs.obs_properties_add_bool(
+            props, "official_names_enabled",
+            "Use official game names (Steam/Epic/GOG records, exe info, OBS Game Capture)"
+        )
         obs.obs_properties_add_bool(
             props, "steam_lookup_enabled",
             "Look up unknown games on Steam (online, last resort only)"
@@ -3956,6 +4039,7 @@ games on Steam.</p>
     obs.obs_data_set_default_string(settings, "new_rename", "=")
     obs.obs_data_set_default_double(settings, "lookback_s", 8)
     obs.obs_data_set_default_bool(settings, "steam_lookup_enabled", true)
+    obs.obs_data_set_default_bool(settings, "official_names_enabled", true)
 end
 
     function Sorter.script_load()
@@ -3991,6 +4075,7 @@ end
     -- check it was written to replace.
     lookback_s = math.max(1, obs.obs_data_get_double(settings, "lookback_s"))
     steam_lookup_enabled = obs.obs_data_get_bool(settings, "steam_lookup_enabled")
+    if C.on then C.on.enabled = obs.obs_data_get_bool(settings, "official_names_enabled") end
 end
 
 ------------------------------------------------------------------
@@ -4115,6 +4200,85 @@ local GENERIC_HOST_EXES = {
 local TITLE_KEYWORD_NAMES = {
     { "minecraft", "Minecraft" },
 }
+
+-- Minecraft's window title always ENDS with the mode: "<name> <version> - Singleplayer",
+-- "... - Multiplayer (3rd-party Server)", "... - Multiplayer (LAN)". The word "Minecraft"
+-- at the start is not reliable: modpacks / launchers (ATLauncher, SKLauncher, title mods)
+-- replace it with their own name. Without this check such a window was named from the
+-- part after the last " - " -- a folder called "Multiplayer (3rd-party Server)".
+local function is_minecraft_mode_title(title)
+    if not title or title == "" then return false end
+    local t = "- " .. title:lower()  -- so a title that is ONLY the mode ("Multiplayer (LAN)") matches too
+    return t:find("%- singleplayer%s*$") ~= nil or t:find("%- multiplayer %b()%s*$") ~= nil
+end
+
+-- A name decided by the WINDOW TITLE, for programs whose exe says nothing (generic hosts)
+-- and for Minecraft-style mode titles. Sources: Minecraft's mode titles, the built-in
+-- TITLE_KEYWORD_NAMES, and your own rules: a line  title:<keyword>=<Folder Name>  in
+-- known_games.txt (or the Add list). Example:  title:hollow knight=Hollow Knight
+local function title_rule_name(title)
+    if title == nil or title == "" then return nil end
+    if is_minecraft_mode_title(title) then return "Minecraft" end
+    local lowered = title:lower()
+    for _, rule in ipairs(TITLE_KEYWORD_NAMES) do
+        if lowered:find(rule[1], 1, true) then return rule[2] end
+    end
+    for _, map in ipairs({ name_map, KNOWN_GAMES }) do
+        for key, name in pairs(map) do
+            if key:sub(1, 6) == "title:" and #key > 6 and lowered:find(key:sub(7), 1, true) then
+                return name
+            end
+        end
+    end
+    return nil
+end
+
+-- "Game 1.2 - Level 3" / "Game 1.2 - Multiplayer (Server)": the state part changes, the
+-- game part stays. For a generic host (javaw, ApplicationFrameHost...) every different title
+-- this exe had in the foreground history is split into segments, and the segment that
+-- appears in the MOST of them is the name. With fewer than two different titles there is
+-- nothing to compare, and the old rule (the part after the last " - ") applies.
+local function split_title_segments(title)
+    local t = title:gsub("%s+%-%s+", "\1"):gsub("%s+|%s+", "\1"):gsub("%s+\226\128\148%s+", "\1")
+    local segs = {}
+    for seg in t:gmatch("[^\1]+") do
+        seg = seg:match("^%s*(.-)%s*$")
+        if seg ~= "" then segs[#segs + 1] = seg end
+    end
+    return segs
+end
+
+local function stable_host_title(lower_exe, current)
+    local titles, seen = {}, {}
+    local function add(t)
+        if t and t ~= "" and not seen[t] then
+            seen[t] = true
+            titles[#titles + 1] = t
+        end
+    end
+    for _, e in ipairs(fg_history or {}) do
+        if e.exe_name and e.exe_name:lower() == lower_exe then add(e.window_title) end
+    end
+    add(current)
+    if #titles >= 2 then
+        local counts = {}
+        for _, t in ipairs(titles) do
+            local in_this = {}
+            for _, seg in ipairs(split_title_segments(t)) do
+                if not in_this[seg] then
+                    in_this[seg] = true
+                    counts[seg] = (counts[seg] or 0) + 1
+                end
+            end
+        end
+        local best, best_n = nil, 1
+        for _, seg in ipairs(split_title_segments(current)) do   -- ties: the earlier segment
+            if counts[seg] and counts[seg] > best_n then best, best_n = seg, counts[seg] end
+        end
+        if best then return best end
+    end
+    return extract_stable_app_name(current)
+end
 
 -- Words in an exe name that are not part of a game's name
 -- ("VALORANT-Win64-Shipping" -> "VALORANT").
@@ -4598,6 +4762,21 @@ local NON_GAME_EXES = {
     explorer = true, discord = true, teams = true, zoom = true,
     obs64 = true, obs32 = true, obs = true, claude = true, code = true,
     notepad = true,
+    -- Game stores / launchers themselves (they live in game-library folders, so without
+    -- this they would be taken for a game now that windowed games count too).
+    steam = true, steamwebhelper = true, steamservice = true,
+    epicgameslauncher = true, epicwebhelper = true,
+    galaxyclient = true, ["battle.net"] = true,
+    riotclientservices = true, riotclientux = true, riotclientuxrender = true,
+    ubisoftconnect = true, upc = true, uplay = true,
+    eadesktop = true, ealauncher = true, origin = true,
+    xboxpcapp = true, gamingservicesui = true,
+    -- Common non-game apps that can go fullscreen.
+    powerpnt = true, winword = true, excel = true, acrobat = true, acrord32 = true,
+    mstsc = true, vmware = true, vmplayer = true, teamviewer = true, anydesk = true,
+    kodi = true, stremio = true, plex = true, slack = true, telegram = true,
+    ["mpc-be64"] = true, ["mpc-hc"] = true, smplayer = true, kmplayer = true,
+    wallpaper32 = true, wallpaper64 = true,
 }
 
 -- Install locations of the common game stores / launchers. In strict mode an
@@ -4627,6 +4806,27 @@ local function is_in_game_library(path)
     return false
 end
 
+-- Where a game is NOT installed. A fullscreen app outside every game library is still
+-- taken for a game (games installed on any drive / any folder), unless it lives in one
+-- of these places: Windows itself, Store apps, Office, browsers, per-user app folders
+-- (Electron apps like Discord / Slack live under AppData).
+local NON_GAME_PATH_MARKERS = {
+    "\\windowsapps\\", "\\microsoft office\\", "\\microsoft\\edge\\",
+    "\\google\\chrome\\", "\\mozilla firefox\\", "\\common files\\", "\\appdata\\",
+}
+
+local function is_plausible_fullscreen_game(path)
+    if not path or path == "" then return false end
+    local p = path:lower():gsub("/", "\\")
+    if p:match("^%a:\\windows\\") then return false end -- the real Windows folder only
+    for _, marker in ipairs(NON_GAME_PATH_MARKERS) do
+        if p:find(marker, 1, true) then
+            return false
+        end
+    end
+    return true
+end
+
 -- "...\\steamapps\\common\\Hades II\\Ship\\Hades2.exe" -> "Hades II" (offline, exact).
 local function steam_folder_name(exe_path)
     if not exe_path then return nil end
@@ -4636,6 +4836,22 @@ end
 
 local function friendly_name(raw_exe_name, window_title, is_fullscreen, exe_path)
     local lower = raw_exe_name:lower()
+
+    -- GENERIC HOSTS (javaw, ApplicationFrameHost, python, dotnet...): the exe does not say
+    -- WHICH program runs, so a list entry keyed by the exe ("javaw=<something>", which older
+    -- versions could save from a window title) must never decide the folder -- it would
+    -- rename every Java program / Store app. They are named from the title instead:
+    -- a title rule first, then the part of the title that stays the same.
+    if GENERIC_HOST_EXES[lower] then
+        local rule = title_rule_name(window_title)
+        if rule then
+            return rule
+        end
+        if window_title ~= nil and window_title ~= "" then
+            return sanitize(stable_host_title(lower, window_title))
+        end
+        return raw_exe_name
+    end
 
     local mapped = name_map[lower]
     if mapped then
@@ -4647,19 +4863,22 @@ local function friendly_name(raw_exe_name, window_title, is_fullscreen, exe_path
         return known
     end
 
+    -- Any program whose window title is a Minecraft mode title is Minecraft, whatever
+    -- the launcher / modpack calls the window and whichever java exe runs it.
+    if is_minecraft_mode_title(window_title) then
+        return "Minecraft"
+    end
+
     local has_title = window_title ~= nil and window_title ~= ""
 
-    if GENERIC_HOST_EXES[lower] then
-        if has_title then
-            local lowered_title = window_title:lower()
-            for _, rule in ipairs(TITLE_KEYWORD_NAMES) do
-                if lowered_title:find(rule[1], 1, true) then
-                    return rule[2]
-                end
-            end
-            return sanitize(extract_stable_app_name(window_title))
+    -- Official name from the launcher's own records (Steam / Epic / GOG) or the exe's
+    -- version info -- offline, and not affected by FPS counters, servers or loading
+    -- screens in the window title (see 32b_organizer_official_names.lua).
+    if C.official_lookup then
+        local official = C.official_lookup(raw_exe_name, exe_path)
+        if official then
+            return official
         end
-        return raw_exe_name
     end
 
     local cached = title_name_cache[lower]
@@ -4681,6 +4900,13 @@ local function friendly_name(raw_exe_name, window_title, is_fullscreen, exe_path
             title_name_cache[lower] = name
         end
         return name
+    end
+
+    -- No window title: the title OBS Game Capture saw for this exe, if it is hooked.
+    local hooked_title = C.on and C.on.hook_title[lower]
+    if hooked_title then
+        title_name_cache[lower] = sanitize(hooked_title)
+        return title_name_cache[lower]
     end
 
     -- No window title: the Steam install folder names the game exactly, offline.
@@ -4717,6 +4943,363 @@ function Sorter.note_foreground(info)
     if info.window_title ~= nil and info.window_title ~= "" then return end
     if not is_in_game_library(info.exe_path) or steam_folder_name(info.exe_path) then return end
     steam_lookup_name(exe)
+end
+------------------------------------------------------------------
+-- Official game names (all OFFLINE, no window title involved)
+--
+-- A window title is the weakest source for a game's name: it changes with
+-- the FPS counter, the server, the modpack, the loading screen. These
+-- sources know the real name instead, and are asked in this order by
+-- friendly_name() (see 32_organizer_steam_names.lua):
+--   1) Steam   steamapps\appmanifest_*.acf   ("name" + "installdir")
+--   2) Epic    ProgramData\Epic\...\Manifests\*.item  (DisplayName + InstallLocation)
+--   3) GOG     goggame-*.info next to the game (name)
+--   4) the exe's own version info (ProductName, then FileDescription),
+--      ignoring generic values like "Unreal Engine" or "Game"
+-- plus OBS Game Capture: the games OBS has hooked are certainly real
+-- games (used by classify_game) and give a title when the window has none.
+--
+-- Everything here is wrapped in pcall by official_lookup(): any failure just
+-- means "no official name" and the old chain (title, Steam folder, Steam
+-- lookup, exe name) carries on exactly as before.
+--
+-- Part of the Organizer's do...end block (opened in 30, closed in 33). Only
+-- ONE chunk-level local is used (the chunk is near LuaJIT's 200-locals
+-- limit): everything lives in the table C.on.
+------------------------------------------------------------------
+C.on = {
+    enabled = true,
+    steam = {},         -- lower "...\steamapps" dir -> { map = { lower installdir -> name }, at = ns }
+    epic = nil,         -- { items = { {name, loc, is_main}, ... }, at = ns }
+    cache = {},         -- lower exe path -> { name = string|false, at = ns }
+    seen_hooked = {},   -- lower exe stem -> true: hooked by an OBS Game Capture source this session
+    hook_title = {},    -- lower exe stem -> title of the hooked window
+    hook_at = nil,      -- ns of the last Game Capture check
+}
+
+do
+    local ON = C.on
+    local NEG_CACHE_NS = 120 * 1e9   -- a "nothing found" answer is asked again after 2 minutes
+    local RESCAN_NS    = 60 * 1e9    -- a launcher's records are re-read at most once a minute on a miss
+
+    -- Values that say nothing about WHICH game it is (compared lowercase, ™/® removed).
+    local GENERIC_PRODUCT = {
+        ["unreal engine"] = true, ["unreal"] = true, ["unity"] = true, ["unity player"] = true,
+        ["game"] = true, ["launcher"] = true, ["application"] = true, ["app"] = true,
+        ["shipping"] = true, ["electron"] = true, ["chromium"] = true, ["godot engine"] = true,
+        ["openjdk platform binary"] = true, ["java(tm) platform se binary"] = true,
+        ["microsoft windows operating system"] = true,
+    }
+
+    ----------------------------------------------------------------
+    -- Pure text helpers (no Win32): these are what the tests exercise
+    ----------------------------------------------------------------
+    function ON.clean(name)
+        if type(name) ~= "string" then return nil end
+        name = name:gsub("\226\132\162", ""):gsub("\194\174", ""):gsub("\194\169", "") -- ™ ® ©
+        name = name:gsub("[%z\1-\31\127]", " "):gsub("%s+", " ")
+        name = name:match("^%s*(.-)%s*$") or ""
+        if #name < 2 then return nil end
+        return name
+    end
+
+    -- Steam's appmanifest (VDF text): returns installdir, name -- or nil.
+    function ON.parse_acf(text)
+        if type(text) ~= "string" then return nil end
+        local dir = text:match('"installdir"%s+"([^"]*)"')
+        local name = text:match('"name"%s+"([^"]*)"')
+        if not dir or not name or dir == "" then return nil end
+        local function unesc(s) return (s:gsub("\\(.)", "%1")) end
+        return unesc(dir), ON.clean(unesc(name))
+    end
+
+    -- "D:\SteamLibrary\steamapps\common\Hades II\Ship\Hades2.exe"
+    --   -> "D:\SteamLibrary\steamapps", "Hades II"
+    function ON.steam_split(exe_path)
+        if not exe_path then return nil end
+        local p = exe_path:gsub("/", "\\")
+        return p:match("^(.-[Ss][Tt][Ee][Aa][Mm][Aa][Pp][Pp][Ss])\\[Cc][Oo][Mm][Mm][Oo][Nn]\\([^\\]+)")
+    end
+
+    -- Epic's .item manifest (JSON): { name, loc (lower, no trailing \), is_main } or nil.
+    function ON.parse_epic(text)
+        if type(text) ~= "string" then return nil end
+        local function field(key)
+            local _, e = text:find('"' .. key .. '"%s*:%s*"')
+            if not e then return nil end
+            return (read_json_string(text, e + 1))
+        end
+        local name, loc = field("DisplayName"), field("InstallLocation")
+        if not name or not loc or name == "" or loc == "" then return nil end
+        local app, main = field("AppName"), field("MainGameAppName")
+        loc = loc:gsub("/", "\\"):gsub("\\+$", ""):lower()
+        return { name = ON.clean(name), loc = loc, is_main = (main == nil or main == "" or main == app) }
+    end
+
+    -- Longest InstallLocation that contains the exe wins; the main game beats its DLC.
+    function ON.epic_pick(items, exe_path)
+        local p = exe_path:gsub("/", "\\"):lower()
+        local best = nil
+        for _, it in ipairs(items) do
+            if it.name and p:sub(1, #it.loc) == it.loc and p:sub(#it.loc + 1, #it.loc + 1) == "\\" then
+                if best == nil or #it.loc > #best.loc or (#it.loc == #best.loc and it.is_main and not best.is_main) then
+                    best = it
+                end
+            end
+        end
+        return best and best.name or nil
+    end
+
+    -- GOG's goggame-<id>.info (JSON). Only the main game has "playTasks"; its
+    -- top-level "name" comes before that key. A DLC info has no playTasks -> nil.
+    function ON.parse_gog(text)
+        if type(text) ~= "string" then return nil end
+        local cut = text:find('"playTasks"', 1, true)
+        if not cut then return nil end
+        local head = text:sub(1, cut - 1)
+        local _, e = head:find('"name"%s*:%s*"')
+        if not e then return nil end
+        return ON.clean((read_json_string(head, e + 1)))
+    end
+
+    -- Picks a usable name from the exe's ProductName / FileDescription, or nil.
+    function ON.pick_version_name(prod, desc, raw_exe)
+        local stem = normalize_for_match(raw_exe or "")
+        for _, cand in ipairs({ prod or false, desc or false }) do
+            local n = cand and ON.clean(cand)
+            if n then
+                n = ON.clean((n:gsub("%s*%-?%s*[Ww]in%d+%-[Ss]hipping$", "")))
+            end
+            if n then
+                local lower = n:lower()
+                local norm = normalize_for_match(n)
+                if not GENERIC_PRODUCT[lower] and not lower:find("^microsoft")
+                   and not lower:find("%.exe$") and #norm >= 3 and norm ~= stem then
+                    return n
+                end
+            end
+        end
+        return nil
+    end
+
+    ----------------------------------------------------------------
+    -- Win32 helpers (replaced by fakes in the tests)
+    ----------------------------------------------------------------
+    local function wide_to_utf8(wptr)
+        local needed = kernel32.WideCharToMultiByte(C.CP_UTF8, 0, wptr, -1, nil, 0, nil, nil)
+        if needed <= 1 then return nil end
+        local buf = ffi.new("char[?]", needed)
+        kernel32.WideCharToMultiByte(C.CP_UTF8, 0, wptr, -1, buf, needed, nil, nil)
+        return ffi.string(buf, needed - 1)
+    end
+
+    -- File names (not folders) in `dir` matching `mask` ("appmanifest_*.acf").
+    function ON.list_dir(dir, mask)
+        local out = {}
+        if not ffi or not kernel32 then return out end
+        pcall(function()
+            pcall(ffi.cdef, [[
+typedef struct {
+    DWORD dwFileAttributes; FILETIME ftCreationTime; FILETIME ftLastAccessTime; FILETIME ftLastWriteTime;
+    DWORD nFileSizeHigh; DWORD nFileSizeLow; DWORD dwReserved0; DWORD dwReserved1;
+    WCHAR cFileName[260]; WCHAR cAlternateFileName[14];
+} WIN32_FIND_DATAW;
+HANDLE FindFirstFileW(const WCHAR* lpFileName, WIN32_FIND_DATAW* lpFindFileData);
+BOOL   FindNextFileW(HANDLE hFindFile, WIN32_FIND_DATAW* lpFindFileData);
+BOOL   FindClose(HANDLE hFindFile);
+]])
+            local data = ffi.new("WIN32_FIND_DATAW")
+            local h = kernel32.FindFirstFileW(utf8_to_wide(dir .. "\\" .. mask), data)
+            if h == nil or tonumber(ffi.cast("intptr_t", h)) == -1 then return end
+            local guard = 0
+            repeat
+                local is_dir = math.floor(tonumber(data.dwFileAttributes) / 16) % 2 == 1
+                if not is_dir then
+                    local n = wide_to_utf8(data.cFileName)
+                    if n then out[#out + 1] = n end
+                end
+                guard = guard + 1
+            until kernel32.FindNextFileW(h, data) == 0 or guard > 5000
+            kernel32.FindClose(h)
+        end)
+        return out
+    end
+
+    function ON.read_text(path)
+        local ok, text = pcall(W.read_file, path)
+        if ok then return text end
+        return nil
+    end
+
+    -- ProductName, FileDescription of an exe (version resource), or nil.
+    function ON.exe_strings(path)
+        if not ffi or not kernel32 or ON.ver_failed then return nil end
+        local ok, prod, desc = pcall(function()
+            if not ON.ver then
+                pcall(ffi.cdef, [[
+DWORD GetFileVersionInfoSizeW(const WCHAR* lptstrFilename, DWORD* lpdwHandle);
+BOOL  GetFileVersionInfoW(const WCHAR* lptstrFilename, DWORD dwHandle, DWORD dwLen, void* lpData);
+BOOL  VerQueryValueW(const void* pBlock, const WCHAR* lpSubBlock, void** lplpBuffer, unsigned int* puLen);
+]])
+                ON.ver = ffi.load("version")
+            end
+            local wpath = utf8_to_wide(path)
+            local size = tonumber(ON.ver.GetFileVersionInfoSizeW(wpath, nil))
+            if size == 0 or size > 4 * 1024 * 1024 then return nil end
+            local data = ffi.new("char[?]", size)
+            if ON.ver.GetFileVersionInfoW(wpath, 0, size, data) == 0 then return nil end
+            local pbuf = ffi.new("void*[1]")
+            local plen = ffi.new("unsigned int[1]")
+            local langs = {}
+            if ON.ver.VerQueryValueW(data, utf8_to_wide("\\VarFileInfo\\Translation"), pbuf, plen) ~= 0 and plen[0] >= 4 then
+                local words = ffi.cast("unsigned short*", pbuf[0])
+                for i = 0, math.min(math.floor(plen[0] / 4), 4) - 1 do
+                    langs[#langs + 1] = string.format("%04x%04x", words[i * 2], words[i * 2 + 1])
+                end
+            end
+            langs[#langs + 1] = "040904b0"
+            langs[#langs + 1] = "040904e4"
+            local function q(key)
+                for _, l in ipairs(langs) do
+                    local sub = "\\StringFileInfo\\" .. l .. "\\" .. key
+                    if ON.ver.VerQueryValueW(data, utf8_to_wide(sub), pbuf, plen) ~= 0 and plen[0] > 1 then
+                        local s = wide_to_utf8(ffi.cast("const WCHAR*", pbuf[0]))
+                        if s and s ~= "" then return s end
+                    end
+                end
+                return nil
+            end
+            return q("ProductName"), q("FileDescription")
+        end)
+        if not ok then
+            ON.ver_failed = true   -- version.dll unusable here: stop trying
+            return nil
+        end
+        return prod, desc
+    end
+
+    ----------------------------------------------------------------
+    -- The launchers
+    ----------------------------------------------------------------
+    function ON.steam_name(exe_path)
+        local lib, folder = ON.steam_split(exe_path)
+        if not lib then return nil end
+        local key, fold = lib:lower(), folder:lower()
+        local entry = ON.steam[key]
+        if entry and entry.map[fold] then return entry.map[fold] end
+        local now = obs.os_gettime_ns()
+        if entry and (now - entry.at) < RESCAN_NS then return nil end
+        local map = {}
+        for _, f in ipairs(ON.list_dir(lib, "appmanifest_*.acf")) do
+            local dir, name = ON.parse_acf(ON.read_text(lib .. "\\" .. f))
+            if dir and name then map[dir:lower()] = name end
+        end
+        ON.steam[key] = { map = map, at = now }
+        return map[fold]
+    end
+
+    function ON.epic_name(exe_path)
+        local now = obs.os_gettime_ns()
+        if ON.epic then
+            local hit = ON.epic_pick(ON.epic.items, exe_path)
+            if hit then return hit end
+            if (now - ON.epic.at) < RESCAN_NS then return nil end
+        end
+        local base = W.getenv("ProgramData") or "C:\\ProgramData"
+        local dir = base .. "\\Epic\\EpicGamesLauncher\\Data\\Manifests"
+        local items = {}
+        for _, f in ipairs(ON.list_dir(dir, "*.item")) do
+            local it = ON.parse_epic(ON.read_text(dir .. "\\" .. f))
+            if it then items[#items + 1] = it end
+        end
+        ON.epic = { items = items, at = now }
+        return ON.epic_pick(items, exe_path)
+    end
+
+    -- goggame-*.info sits in the game's root; the exe can be a few folders deeper.
+    function ON.gog_name(exe_path)
+        local dir = exe_path:gsub("/", "\\"):match("^(.*)\\[^\\]+$")
+        for _ = 1, 4 do
+            if not dir or #dir < 4 then return nil end
+            for _, f in ipairs(ON.list_dir(dir, "goggame-*.info")) do
+                local name = ON.parse_gog(ON.read_text(dir .. "\\" .. f))
+                if name then return name end
+            end
+            dir = dir:match("^(.*)\\[^\\]+$")
+        end
+        return nil
+    end
+
+    function ON.version_name(raw_exe_name, exe_path)
+        local prod, desc = ON.exe_strings(exe_path)
+        return ON.pick_version_name(prod, desc, raw_exe_name)
+    end
+
+    ----------------------------------------------------------------
+    -- Entry point used by friendly_name(): name or nil. Cached per exe path.
+    ----------------------------------------------------------------
+    function C.official_lookup(raw_exe_name, exe_path)
+        if not ON.enabled or not exe_path or exe_path == "" then return nil end
+        local key = exe_path:lower()
+        local now = obs.os_gettime_ns()
+        local hit = ON.cache[key]
+        if hit and (hit.name or (now - hit.at) < NEG_CACHE_NS) then
+            return hit.name or nil
+        end
+        local name, src = nil, nil
+        local ok, err = pcall(function()
+            name = ON.steam_name(exe_path)
+            if name then src = "Steam" return end
+            if not ON.steam_split(exe_path) then
+                name = ON.epic_name(exe_path)
+                if name then src = "Epic" return end
+                name = ON.gog_name(exe_path)
+                if name then src = "GOG" return end
+            end
+            name = ON.version_name(raw_exe_name, exe_path)
+            if name then src = "exe info" end
+        end)
+        if not ok then
+            print("OBS Replay Organizer: official-name lookup failed for '" .. tostring(raw_exe_name) .. "': " .. tostring(err))
+            name = nil
+        end
+        ON.cache[key] = { name = name or false, at = now }
+        if name then
+            print("OBS Replay Organizer: official name '" .. name .. "' for '" .. tostring(raw_exe_name) .. "' (from " .. src .. ").")
+        end
+        return name
+    end
+
+    ----------------------------------------------------------------
+    -- OBS Game Capture: which exe is hooked right now?
+    -- Called from the foreground poll; throttled to once every 3 seconds.
+    ----------------------------------------------------------------
+    function ON.refresh_hooked()
+        if not ON.enabled then return end
+        local now = obs.os_gettime_ns()
+        if ON.hook_at and (now - ON.hook_at) < 3e9 then return end
+        ON.hook_at = now
+        local sources = obs.obs_enum_sources()
+        if sources == nil then return end
+        for _, src in ipairs(sources) do
+            if obs.obs_source_get_unversioned_id(src) == "game_capture" then
+                local ph = obs.obs_source_get_proc_handler(src)
+                if ph ~= nil then
+                    local cd = obs.calldata_create()
+                    if obs.proc_handler_call(ph, "get_hooked", cd) and obs.calldata_bool(cd, "hooked") then
+                        local exe = (obs.calldata_string(cd, "executable") or ""):gsub("%.[Ee][Xx][Ee]$", ""):lower()
+                        if exe ~= "" then
+                            ON.seen_hooked[exe] = true
+                            local title = ON.clean(obs.calldata_string(cd, "title"))
+                            if title then ON.hook_title[exe] = title end
+                        end
+                    end
+                    obs.calldata_destroy(cd)
+                end
+            end
+        end
+        obs.source_list_release(sources)
+    end
 end
 -- Creates dest_folder via a direct Win32 call (no cmd.exe / mkdir process).
 -- Only handles a single-level create, same as the old "mkdir" call did;
@@ -4854,6 +5437,40 @@ local function move_file(src, dest_folder, new_base_name, on_moved_later)
 end
 
 ------------------------------------------------------------------
+-- Is this foreground sample a game?  (also used on old history samples)
+------------------------------------------------------------------
+local function classify_game(info)
+    if info == nil then return false end
+    -- Exe unreadable (anti-cheat/protected) but fullscreen and titled: a game.
+    if info.protected then return true end
+    local exe_lower = info.exe_name:lower()
+    if NON_GAME_EXES[exe_lower] and not name_map[exe_lower] then
+        -- Browsers, Explorer, Discord, OBS, game launchers...: never a game, even
+        -- if a stray entry exists in known_games.txt -- unless YOU named it with
+        -- the "Add" button (name_map), which always wins.
+        return false
+    end
+    -- A game you (or the built-in list) named is a game even windowed.
+    if not GENERIC_HOST_EXES[exe_lower] and (name_map[exe_lower] or KNOWN_GAMES[exe_lower]) then return true end
+    -- An exe that an OBS Game Capture source has hooked is rendering 3D graphics: a game.
+    if C.on and C.on.seen_hooked[exe_lower] then return true end
+    -- A Minecraft window (see is_minecraft_mode_title), under any launcher / java exe.
+    if is_minecraft_mode_title(info.window_title) then return true end
+    if GENERIC_HOST_EXES[exe_lower] then
+        -- javaw / ApplicationFrameHost: only a game if the title says so
+        -- (e.g. Minecraft); the exe alone can't tell.
+        return title_rule_name(info.window_title) ~= nil
+    end
+    -- Unknown app. Installed in a game library (Steam, Epic, GOG, Riot, ...): a game,
+    -- fullscreen OR windowed.
+    if is_in_game_library(info.exe_path) then return true end
+    -- Anywhere else: a game if it is fullscreen and not a system / Office / browser /
+    -- per-user app (games installed on another drive or in a custom folder).
+    if info.is_fullscreen and is_plausible_fullscreen_game(info.exe_path) then return true end
+    return false
+end
+
+------------------------------------------------------------------
 -- Main event handler
 ------------------------------------------------------------------
     function Sorter.on_replay_saved()
@@ -4877,56 +5494,49 @@ end
         return
     end
 
-    -- Use whichever app dominated the foreground over the last few
-    -- seconds (see fg_history above), not just whatever happens to be
-    -- focused at the exact instant this event fires -- that instant can
-    -- already be a couple of seconds after the user pressed the save
-    -- hotkey and alt-tabbed away (to Discord, etc.).
-    local info = get_dominant_foreground(lookback_s)
-    if info == nil then
-        -- No history yet (e.g. right after the script loaded) -- fall
-        -- back to the plain instantaneous check.
-        info = get_foreground_info()
+    -- The LAST game that was in front during the last minute (or less, if the Replay
+    -- Buffer is shorter) decides: you played, maybe switched to another game, maybe
+    -- went to the desktop / Discord / a browser, and then pressed save -- the clip is
+    -- from the game you were playing last. Only a game that stayed in front for at
+    -- least 2 seconds counts, so a window flashing past is ignored.
+    local info = get_recent_game(game_memory_seconds(), classify_game, 2)
+    local is_game = info ~= nil
+    local from_memory = false
+    if is_game then
+        -- Say in the log when the game was no longer in front at the moment of the save.
+        local now_info = get_dominant_foreground(2)
+        from_memory = not (now_info ~= nil and now_info.exe_name == info.exe_name)
+    else
+        -- No game in the last minute. Use whatever was in front over the last few
+        -- seconds (see fg_history above); right after the script loaded there is no
+        -- history yet, so fall back to the plain instantaneous check.
+        info = get_dominant_foreground(lookback_s)
+        if info == nil then
+            info = get_foreground_info()
+        end
+        is_game = classify_game(info)
     end
     local game = "Desktop"
-    local is_game = false
     if info == nil then
         print("OBS Replay Organizer: couldn't detect the foreground app — sorting into 'Desktop'.")
-    elseif info.protected then
-        -- Exe unreadable (anti-cheat/protected) but the window is fullscreen
-        -- and titled: treat as a game, named from the title.
-        is_game = true
-        game = extract_stable_app_name(info.window_title, true)
-    else
-        local exe_lower = info.exe_name:lower()
-        if NON_GAME_EXES[exe_lower] and not name_map[exe_lower] then
-            -- Browsers, Explorer, Discord, OBS itself...: never a game, even
-            -- if a stray entry for them exists in known_games.txt -- unless YOU
-            -- named it with the "Add" button (name_map), which always wins.
-            is_game = false
-        elseif name_map[exe_lower] or KNOWN_GAMES[exe_lower] then
-            -- A game you (or the built-in list) named is a game even windowed.
-            is_game = true
-        elseif GENERIC_HOST_EXES[exe_lower] then
-            -- javaw / ApplicationFrameHost: only a game if the title says so
-            -- (e.g. Minecraft); the exe alone can't tell.
-            local t = (info.window_title or ""):lower()
-            for _, rule in ipairs(TITLE_KEYWORD_NAMES) do
-                if t:find(rule[1], 1, true) then is_game = true end
+    elseif is_game then
+        if info.protected then
+            -- Exe unreadable (anti-cheat/protected) but the window is fullscreen
+            -- and titled: named from the title.
+            if is_minecraft_mode_title(info.window_title) then
+                game = "Minecraft" -- same rule as friendly_name: the mode suffix is not a game name
+            else
+                game = extract_stable_app_name(info.window_title, true)
             end
         else
-            -- Unknown app: a game only if fullscreen AND installed in a game library.
-            is_game = (info.is_fullscreen and is_in_game_library(info.exe_path)) and true or false
-        end
-        -- The name (and any Steam lookup) is resolved ONLY for games.
-        if is_game then
             game = friendly_name(info.exe_name, info.window_title, info.is_fullscreen, info.exe_path)
         end
     end
     game = sanitize(game)
     print("OBS Replay Organizer: detected exe='" .. (info and info.exe_name or "?") ..
+          "' title='" .. tostring(info and info.window_title) ..
           "' fullscreen=" .. tostring(info and info.is_fullscreen) ..
-          " game=" .. tostring(is_game))
+          " game=" .. tostring(is_game) .. (from_memory and " (the last game seen in the past minute)" or ""))
 
     -- Keep the folder-name index (used by the "Add" fields above) fresh
     -- even for games that were never in any static list and were only
@@ -6569,7 +7179,7 @@ local function resume_replay_buffer_after_relaunch(marker)
 end
 
 function script_load(settings)
-    print("OBS Clip Suite v" .. VERSION .. " loaded (games-only organizer)")
+    print("OBS Clip Suite v" .. VERSION .. " loaded (games-only organizer, build: official-names+minecraft-fix) from " .. tostring(script_path()))
     obs.obs_frontend_add_event_callback(on_frontend_event)
     guard("Sorter.script_load", Sorter.script_load)
 

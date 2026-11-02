@@ -37,6 +37,85 @@ local TITLE_KEYWORD_NAMES = {
     { "minecraft", "Minecraft" },
 }
 
+-- Minecraft's window title always ENDS with the mode: "<name> <version> - Singleplayer",
+-- "... - Multiplayer (3rd-party Server)", "... - Multiplayer (LAN)". The word "Minecraft"
+-- at the start is not reliable: modpacks / launchers (ATLauncher, SKLauncher, title mods)
+-- replace it with their own name. Without this check such a window was named from the
+-- part after the last " - " -- a folder called "Multiplayer (3rd-party Server)".
+local function is_minecraft_mode_title(title)
+    if not title or title == "" then return false end
+    local t = "- " .. title:lower()  -- so a title that is ONLY the mode ("Multiplayer (LAN)") matches too
+    return t:find("%- singleplayer%s*$") ~= nil or t:find("%- multiplayer %b()%s*$") ~= nil
+end
+
+-- A name decided by the WINDOW TITLE, for programs whose exe says nothing (generic hosts)
+-- and for Minecraft-style mode titles. Sources: Minecraft's mode titles, the built-in
+-- TITLE_KEYWORD_NAMES, and your own rules: a line  title:<keyword>=<Folder Name>  in
+-- known_games.txt (or the Add list). Example:  title:hollow knight=Hollow Knight
+local function title_rule_name(title)
+    if title == nil or title == "" then return nil end
+    if is_minecraft_mode_title(title) then return "Minecraft" end
+    local lowered = title:lower()
+    for _, rule in ipairs(TITLE_KEYWORD_NAMES) do
+        if lowered:find(rule[1], 1, true) then return rule[2] end
+    end
+    for _, map in ipairs({ name_map, KNOWN_GAMES }) do
+        for key, name in pairs(map) do
+            if key:sub(1, 6) == "title:" and #key > 6 and lowered:find(key:sub(7), 1, true) then
+                return name
+            end
+        end
+    end
+    return nil
+end
+
+-- "Game 1.2 - Level 3" / "Game 1.2 - Multiplayer (Server)": the state part changes, the
+-- game part stays. For a generic host (javaw, ApplicationFrameHost...) every different title
+-- this exe had in the foreground history is split into segments, and the segment that
+-- appears in the MOST of them is the name. With fewer than two different titles there is
+-- nothing to compare, and the old rule (the part after the last " - ") applies.
+local function split_title_segments(title)
+    local t = title:gsub("%s+%-%s+", "\1"):gsub("%s+|%s+", "\1"):gsub("%s+\226\128\148%s+", "\1")
+    local segs = {}
+    for seg in t:gmatch("[^\1]+") do
+        seg = seg:match("^%s*(.-)%s*$")
+        if seg ~= "" then segs[#segs + 1] = seg end
+    end
+    return segs
+end
+
+local function stable_host_title(lower_exe, current)
+    local titles, seen = {}, {}
+    local function add(t)
+        if t and t ~= "" and not seen[t] then
+            seen[t] = true
+            titles[#titles + 1] = t
+        end
+    end
+    for _, e in ipairs(fg_history or {}) do
+        if e.exe_name and e.exe_name:lower() == lower_exe then add(e.window_title) end
+    end
+    add(current)
+    if #titles >= 2 then
+        local counts = {}
+        for _, t in ipairs(titles) do
+            local in_this = {}
+            for _, seg in ipairs(split_title_segments(t)) do
+                if not in_this[seg] then
+                    in_this[seg] = true
+                    counts[seg] = (counts[seg] or 0) + 1
+                end
+            end
+        end
+        local best, best_n = nil, 1
+        for _, seg in ipairs(split_title_segments(current)) do   -- ties: the earlier segment
+            if counts[seg] and counts[seg] > best_n then best, best_n = seg, counts[seg] end
+        end
+        if best then return best end
+    end
+    return extract_stable_app_name(current)
+end
+
 -- Words in an exe name that are not part of a game's name
 -- ("VALORANT-Win64-Shipping" -> "VALORANT").
 local STEAM_NOISE_WORDS = {
@@ -519,6 +598,21 @@ local NON_GAME_EXES = {
     explorer = true, discord = true, teams = true, zoom = true,
     obs64 = true, obs32 = true, obs = true, claude = true, code = true,
     notepad = true,
+    -- Game stores / launchers themselves (they live in game-library folders, so without
+    -- this they would be taken for a game now that windowed games count too).
+    steam = true, steamwebhelper = true, steamservice = true,
+    epicgameslauncher = true, epicwebhelper = true,
+    galaxyclient = true, ["battle.net"] = true,
+    riotclientservices = true, riotclientux = true, riotclientuxrender = true,
+    ubisoftconnect = true, upc = true, uplay = true,
+    eadesktop = true, ealauncher = true, origin = true,
+    xboxpcapp = true, gamingservicesui = true,
+    -- Common non-game apps that can go fullscreen.
+    powerpnt = true, winword = true, excel = true, acrobat = true, acrord32 = true,
+    mstsc = true, vmware = true, vmplayer = true, teamviewer = true, anydesk = true,
+    kodi = true, stremio = true, plex = true, slack = true, telegram = true,
+    ["mpc-be64"] = true, ["mpc-hc"] = true, smplayer = true, kmplayer = true,
+    wallpaper32 = true, wallpaper64 = true,
 }
 
 -- Install locations of the common game stores / launchers. In strict mode an
@@ -548,6 +642,27 @@ local function is_in_game_library(path)
     return false
 end
 
+-- Where a game is NOT installed. A fullscreen app outside every game library is still
+-- taken for a game (games installed on any drive / any folder), unless it lives in one
+-- of these places: Windows itself, Store apps, Office, browsers, per-user app folders
+-- (Electron apps like Discord / Slack live under AppData).
+local NON_GAME_PATH_MARKERS = {
+    "\\windowsapps\\", "\\microsoft office\\", "\\microsoft\\edge\\",
+    "\\google\\chrome\\", "\\mozilla firefox\\", "\\common files\\", "\\appdata\\",
+}
+
+local function is_plausible_fullscreen_game(path)
+    if not path or path == "" then return false end
+    local p = path:lower():gsub("/", "\\")
+    if p:match("^%a:\\windows\\") then return false end -- the real Windows folder only
+    for _, marker in ipairs(NON_GAME_PATH_MARKERS) do
+        if p:find(marker, 1, true) then
+            return false
+        end
+    end
+    return true
+end
+
 -- "...\\steamapps\\common\\Hades II\\Ship\\Hades2.exe" -> "Hades II" (offline, exact).
 local function steam_folder_name(exe_path)
     if not exe_path then return nil end
@@ -557,6 +672,22 @@ end
 
 local function friendly_name(raw_exe_name, window_title, is_fullscreen, exe_path)
     local lower = raw_exe_name:lower()
+
+    -- GENERIC HOSTS (javaw, ApplicationFrameHost, python, dotnet...): the exe does not say
+    -- WHICH program runs, so a list entry keyed by the exe ("javaw=<something>", which older
+    -- versions could save from a window title) must never decide the folder -- it would
+    -- rename every Java program / Store app. They are named from the title instead:
+    -- a title rule first, then the part of the title that stays the same.
+    if GENERIC_HOST_EXES[lower] then
+        local rule = title_rule_name(window_title)
+        if rule then
+            return rule
+        end
+        if window_title ~= nil and window_title ~= "" then
+            return sanitize(stable_host_title(lower, window_title))
+        end
+        return raw_exe_name
+    end
 
     local mapped = name_map[lower]
     if mapped then
@@ -568,19 +699,22 @@ local function friendly_name(raw_exe_name, window_title, is_fullscreen, exe_path
         return known
     end
 
+    -- Any program whose window title is a Minecraft mode title is Minecraft, whatever
+    -- the launcher / modpack calls the window and whichever java exe runs it.
+    if is_minecraft_mode_title(window_title) then
+        return "Minecraft"
+    end
+
     local has_title = window_title ~= nil and window_title ~= ""
 
-    if GENERIC_HOST_EXES[lower] then
-        if has_title then
-            local lowered_title = window_title:lower()
-            for _, rule in ipairs(TITLE_KEYWORD_NAMES) do
-                if lowered_title:find(rule[1], 1, true) then
-                    return rule[2]
-                end
-            end
-            return sanitize(extract_stable_app_name(window_title))
+    -- Official name from the launcher's own records (Steam / Epic / GOG) or the exe's
+    -- version info -- offline, and not affected by FPS counters, servers or loading
+    -- screens in the window title (see 32b_organizer_official_names.lua).
+    if C.official_lookup then
+        local official = C.official_lookup(raw_exe_name, exe_path)
+        if official then
+            return official
         end
-        return raw_exe_name
     end
 
     local cached = title_name_cache[lower]
@@ -602,6 +736,13 @@ local function friendly_name(raw_exe_name, window_title, is_fullscreen, exe_path
             title_name_cache[lower] = name
         end
         return name
+    end
+
+    -- No window title: the title OBS Game Capture saw for this exe, if it is hooked.
+    local hooked_title = C.on and C.on.hook_title[lower]
+    if hooked_title then
+        title_name_cache[lower] = sanitize(hooked_title)
+        return title_name_cache[lower]
     end
 
     -- No window title: the Steam install folder names the game exactly, offline.

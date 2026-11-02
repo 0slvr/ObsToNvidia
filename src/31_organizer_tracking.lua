@@ -41,7 +41,9 @@ local steam_lookup_enabled = true
 local pending_move_timers = {}
 
 local FG_POLL_MS       = 500        -- how often we sample the foreground window
-local FG_HISTORY_MAX_S = 120        -- drop samples older than this (keeps the table small)
+-- Long enough to cover the whole Replay Buffer (up to 30 min) so that a clip saved from
+-- the desktop can still be traced back to the game that is in it (see get_recent_game).
+local FG_HISTORY_MAX_S = 1800       -- drop samples older than this (keeps the table small)
 local fg_history = {}               -- { {start_ns, end_ns, exe_name, window_title, is_fullscreen}, ... }
 
 local function fg_poll_tick()
@@ -65,6 +67,8 @@ local function fg_poll_tick()
     -- Lets the Steam-name code queue a background lookup for a brand-new game
     -- (defined further down; nothing here waits for the network).
     if Sorter.note_foreground then pcall(Sorter.note_foreground, info) end
+    -- Which games OBS Game Capture has hooked (throttled inside; see 32b).
+    if C.on and C.on.refresh_hooked then pcall(C.on.refresh_hooked) end
 
     local last = fg_history[#fg_history]
     -- Polling is skipped entirely whenever the Replay Buffer isn't running
@@ -145,6 +149,66 @@ local function get_dominant_foreground(seconds)
     for _, rec in pairs(totals) do
         if rec.duration_ns > best_ns or (rec.duration_ns == best_ns and rec.last_ns > best_last) then
             best, best_ns, best_last = rec.info, rec.duration_ns, rec.last_ns
+        end
+    end
+    return best
+end
+
+-- Length of the Replay Buffer in seconds, read from the active OBS profile
+-- (Simple or Advanced output mode). nil if it can't be read.
+local function replay_buffer_seconds()
+    local ok, secs = pcall(function()
+        local cfg = obs.obs_frontend_get_profile_config()
+        if cfg == nil then return nil end
+        local mode = obs.config_get_string(cfg, "Output", "Mode")
+        local section = (mode == "Advanced") and "AdvOut" or "SimpleOutput"
+        local v = tonumber(obs.config_get_int(cfg, section, "RecRBTime"))
+        if v and v > 0 then return v end
+        return nil
+    end)
+    if ok then return secs end
+    return nil
+end
+
+-- How far back to look for a game when the foreground at save time is NOT a game
+-- (you played, went to the desktop / Discord / browser, and then saved).
+-- At most ONE minute, and never longer than the Replay Buffer itself (a clip can't
+-- contain anything older than the buffer). Never less than 10 seconds.
+local function game_memory_seconds()
+    local w = math.min(replay_buffer_seconds() or 60, 60)
+    return math.max(w, 10)
+end
+
+-- Looks through the last `seconds` of history for a GAME (is_game(entry) decides)
+-- and returns the one that was in front MOST RECENTLY, as the latest history entry
+-- of that game -- or nil if there was none. A game only counts if it was in front for
+-- at least `min_s` seconds in total, so a flash of a window passing by is ignored.
+-- Playing A, then B, then going to the desktop -> B (the last game you played).
+local function get_recent_game(seconds, is_game, min_s)
+    local now = obs.os_gettime_ns()
+    local window_start = now - (seconds * 1e9)
+    local totals = {}
+    for _, entry in ipairs(fg_history) do
+        local s = math.max(entry.start_ns, window_start)
+        local e = math.min(entry.end_ns, now)
+        if e > s and entry.exe_name and is_game(entry) then
+            -- Protected (anti-cheat) games all share the placeholder exe name, so
+            -- they are told apart by their window title instead.
+            local key = entry.protected and ("?p:" .. tostring(entry.window_title)) or entry.exe_name:lower()
+            local rec = totals[key]
+            if not rec then
+                rec = { duration_ns = 0 }
+                totals[key] = rec
+            end
+            rec.info = entry        -- chronological: ends up as the LATEST game sample
+            rec.last_ns = entry.end_ns
+            rec.duration_ns = rec.duration_ns + (e - s)
+        end
+    end
+    local best, best_last = nil, -1
+    for _, rec in pairs(totals) do
+        if rec.duration_ns >= (min_s or 0) * 1e9 and rec.last_ns > best_last then
+            best, best_last = rec.info, rec.last_ns
         end
     end
     return best
@@ -528,8 +592,23 @@ local function add_mapping_clicked(props, property)
 
     local raw = last_seen_exe_by_folder[sanitize(current_folder):lower()]
     if raw == nil then
+        -- Not a folder name we know: maybe it's the program's own exe name (as Task
+        -- Manager shows it, e.g. "MyGame" or "MyGame.exe") of something that was in
+        -- front recently. This is how a game the script doesn't recognise (windowed,
+        -- installed in an unusual folder...) can be taught without a clip first.
+        local want = (current_folder:lower():gsub("%.exe$", ""))
+        for i = #fg_history, 1, -1 do
+            local e = fg_history[i]
+            if e.exe_name and not e.protected and e.exe_name:lower() == want then
+                raw = want
+                break
+            end
+        end
+    end
+    if raw == nil then
         print("OBS Replay Organizer: no clip has been sorted into a folder named '" ..
-              current_folder .. "' yet -- play that game and save one clip first, then try renaming it again.")
+              current_folder .. "' yet, and no program with that exe name was in front recently -- " ..
+              "play that game and save one clip first (or type its exe name as in Task Manager), then try again.")
         return false
     end
 
@@ -567,6 +646,10 @@ games on Steam.</p>
     end
 
     function Sorter.script_properties(props)
+        obs.obs_properties_add_bool(
+            props, "official_names_enabled",
+            "Use official game names (Steam/Epic/GOG records, exe info, OBS Game Capture)"
+        )
         obs.obs_properties_add_bool(
             props, "steam_lookup_enabled",
             "Look up unknown games on Steam (online, last resort only)"
@@ -611,6 +694,7 @@ games on Steam.</p>
     obs.obs_data_set_default_string(settings, "new_rename", "=")
     obs.obs_data_set_default_double(settings, "lookback_s", 8)
     obs.obs_data_set_default_bool(settings, "steam_lookup_enabled", true)
+    obs.obs_data_set_default_bool(settings, "official_names_enabled", true)
 end
 
     function Sorter.script_load()
@@ -646,6 +730,7 @@ end
     -- check it was written to replace.
     lookback_s = math.max(1, obs.obs_data_get_double(settings, "lookback_s"))
     steam_lookup_enabled = obs.obs_data_get_bool(settings, "steam_lookup_enabled")
+    if C.on then C.on.enabled = obs.obs_data_get_bool(settings, "official_names_enabled") end
 end
 
 ------------------------------------------------------------------

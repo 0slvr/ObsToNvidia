@@ -134,6 +134,40 @@ local function move_file(src, dest_folder, new_base_name, on_moved_later)
 end
 
 ------------------------------------------------------------------
+-- Is this foreground sample a game?  (also used on old history samples)
+------------------------------------------------------------------
+local function classify_game(info)
+    if info == nil then return false end
+    -- Exe unreadable (anti-cheat/protected) but fullscreen and titled: a game.
+    if info.protected then return true end
+    local exe_lower = info.exe_name:lower()
+    if NON_GAME_EXES[exe_lower] and not name_map[exe_lower] then
+        -- Browsers, Explorer, Discord, OBS, game launchers...: never a game, even
+        -- if a stray entry exists in known_games.txt -- unless YOU named it with
+        -- the "Add" button (name_map), which always wins.
+        return false
+    end
+    -- A game you (or the built-in list) named is a game even windowed.
+    if not GENERIC_HOST_EXES[exe_lower] and (name_map[exe_lower] or KNOWN_GAMES[exe_lower]) then return true end
+    -- An exe that an OBS Game Capture source has hooked is rendering 3D graphics: a game.
+    if C.on and C.on.seen_hooked[exe_lower] then return true end
+    -- A Minecraft window (see is_minecraft_mode_title), under any launcher / java exe.
+    if is_minecraft_mode_title(info.window_title) then return true end
+    if GENERIC_HOST_EXES[exe_lower] then
+        -- javaw / ApplicationFrameHost: only a game if the title says so
+        -- (e.g. Minecraft); the exe alone can't tell.
+        return title_rule_name(info.window_title) ~= nil
+    end
+    -- Unknown app. Installed in a game library (Steam, Epic, GOG, Riot, ...): a game,
+    -- fullscreen OR windowed.
+    if is_in_game_library(info.exe_path) then return true end
+    -- Anywhere else: a game if it is fullscreen and not a system / Office / browser /
+    -- per-user app (games installed on another drive or in a custom folder).
+    if info.is_fullscreen and is_plausible_fullscreen_game(info.exe_path) then return true end
+    return false
+end
+
+------------------------------------------------------------------
 -- Main event handler
 ------------------------------------------------------------------
     function Sorter.on_replay_saved()
@@ -157,56 +191,49 @@ end
         return
     end
 
-    -- Use whichever app dominated the foreground over the last few
-    -- seconds (see fg_history above), not just whatever happens to be
-    -- focused at the exact instant this event fires -- that instant can
-    -- already be a couple of seconds after the user pressed the save
-    -- hotkey and alt-tabbed away (to Discord, etc.).
-    local info = get_dominant_foreground(lookback_s)
-    if info == nil then
-        -- No history yet (e.g. right after the script loaded) -- fall
-        -- back to the plain instantaneous check.
-        info = get_foreground_info()
+    -- The LAST game that was in front during the last minute (or less, if the Replay
+    -- Buffer is shorter) decides: you played, maybe switched to another game, maybe
+    -- went to the desktop / Discord / a browser, and then pressed save -- the clip is
+    -- from the game you were playing last. Only a game that stayed in front for at
+    -- least 2 seconds counts, so a window flashing past is ignored.
+    local info = get_recent_game(game_memory_seconds(), classify_game, 2)
+    local is_game = info ~= nil
+    local from_memory = false
+    if is_game then
+        -- Say in the log when the game was no longer in front at the moment of the save.
+        local now_info = get_dominant_foreground(2)
+        from_memory = not (now_info ~= nil and now_info.exe_name == info.exe_name)
+    else
+        -- No game in the last minute. Use whatever was in front over the last few
+        -- seconds (see fg_history above); right after the script loaded there is no
+        -- history yet, so fall back to the plain instantaneous check.
+        info = get_dominant_foreground(lookback_s)
+        if info == nil then
+            info = get_foreground_info()
+        end
+        is_game = classify_game(info)
     end
     local game = "Desktop"
-    local is_game = false
     if info == nil then
         print("OBS Replay Organizer: couldn't detect the foreground app — sorting into 'Desktop'.")
-    elseif info.protected then
-        -- Exe unreadable (anti-cheat/protected) but the window is fullscreen
-        -- and titled: treat as a game, named from the title.
-        is_game = true
-        game = extract_stable_app_name(info.window_title, true)
-    else
-        local exe_lower = info.exe_name:lower()
-        if NON_GAME_EXES[exe_lower] and not name_map[exe_lower] then
-            -- Browsers, Explorer, Discord, OBS itself...: never a game, even
-            -- if a stray entry for them exists in known_games.txt -- unless YOU
-            -- named it with the "Add" button (name_map), which always wins.
-            is_game = false
-        elseif name_map[exe_lower] or KNOWN_GAMES[exe_lower] then
-            -- A game you (or the built-in list) named is a game even windowed.
-            is_game = true
-        elseif GENERIC_HOST_EXES[exe_lower] then
-            -- javaw / ApplicationFrameHost: only a game if the title says so
-            -- (e.g. Minecraft); the exe alone can't tell.
-            local t = (info.window_title or ""):lower()
-            for _, rule in ipairs(TITLE_KEYWORD_NAMES) do
-                if t:find(rule[1], 1, true) then is_game = true end
+    elseif is_game then
+        if info.protected then
+            -- Exe unreadable (anti-cheat/protected) but the window is fullscreen
+            -- and titled: named from the title.
+            if is_minecraft_mode_title(info.window_title) then
+                game = "Minecraft" -- same rule as friendly_name: the mode suffix is not a game name
+            else
+                game = extract_stable_app_name(info.window_title, true)
             end
         else
-            -- Unknown app: a game only if fullscreen AND installed in a game library.
-            is_game = (info.is_fullscreen and is_in_game_library(info.exe_path)) and true or false
-        end
-        -- The name (and any Steam lookup) is resolved ONLY for games.
-        if is_game then
             game = friendly_name(info.exe_name, info.window_title, info.is_fullscreen, info.exe_path)
         end
     end
     game = sanitize(game)
     print("OBS Replay Organizer: detected exe='" .. (info and info.exe_name or "?") ..
+          "' title='" .. tostring(info and info.window_title) ..
           "' fullscreen=" .. tostring(info and info.is_fullscreen) ..
-          " game=" .. tostring(is_game))
+          " game=" .. tostring(is_game) .. (from_memory and " (the last game seen in the past minute)" or ""))
 
     -- Keep the folder-name index (used by the "Add" fields above) fresh
     -- even for games that were never in any static list and were only

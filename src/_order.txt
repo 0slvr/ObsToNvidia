@@ -7,6 +7,7 @@
 30_organizer_win32.lua
 31_organizer_tracking.lua
 32_organizer_steam_names.lua
+32b_organizer_official_names.lua
 33_organizer_files.lua
 40_updater_core.lua
 41_updater_install.lua

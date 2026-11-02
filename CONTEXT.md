@@ -12,6 +12,8 @@ OBS Lua script **obs_to_nvidia.lua** (OBS Clip Suite). The real script is the Lu
 5. Blocks continue across files - do not add/remove a stray `do` / `end`:
    - `20_alert_sounds_data.lua` opens `do` (inside `local Alert = {}`); `21_alert_sound.lua` closes it.
    - `30_organizer_win32.lua` opens the Organizer's `do`; `33_organizer_files.lua` closes it.
+     `32b_organizer_official_names.lua` sits inside that block and has its own balanced `do ... end`.
+     `friendly_name()` (32) reaches it late-bound through `C.official_lookup`, so 32 does not need it defined earlier.
    - `40_updater_core.lua` opens the Updater's `do`; `42_updater_check.lua` closes it.
 6. `VERSION` in `00_core.lua` is raised automatically by the Publish Release step - do not bump it by hand
    (unless the person asks).
@@ -27,6 +29,7 @@ OBS Lua script **obs_to_nvidia.lua** (OBS Clip Suite). The real script is the Lu
 | `30_organizer_win32.lua` | 654 | Module 2 start: Win32 FFI, window title/class, foreground info | Win32 calls, window detection |
 | `31_organizer_tracking.lua` | 708 | Organizer settings, foreground history, known games, folder names, "Add" button | game detection, name map, UI |
 | `32_organizer_steam_names.lua` | 495 | Steam lookup, title cleanup, `friendly_name()` | how folder names are chosen |
+| `32b_organizer_official_names.lua` | 330 | official names: Steam `appmanifest`, Epic `.item`, GOG `goggame-*.info`, exe ProductName, OBS Game Capture (all in table `C.on`) | which source names a game, hooked-game detection |
 | `33_organizer_files.lua` | 253 | folder creation, `move_file`, Organizer hooks | moving/renaming clips |
 | `40_updater_core.lua` | 287 | Module 4 start: GitHub config, version compare, write update file | repo, version rules |
 | `41_updater_install.lua` | 372 | update prompt, staging, relaunch OBS | install/relaunch flow |

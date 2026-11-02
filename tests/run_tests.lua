@@ -160,7 +160,12 @@ local function new_steam(opts)
         extract_stable_app_name = function(t) return t end,
         print = function(...) printed[#printed + 1] = table.concat({ ... }, " ") end,
     }
+    if opts.official then
+        env.ffi = nil  -- no real Win32 in the tests: directory / file / exe-info access is faked per test
+        env.W = { write_file = env.W.write_file, getenv = function() return "C:\\ProgramData" end }
+    end
     local api = compile(read("src/32_organizer_steam_names.lua") ..
+        (opts.official and read("src/32b_organizer_official_names.lua") or "") ..
         "\nreturn { friendly_name = friendly_name, pick = pick_steam_name }", "32_steam", env)()
     local function tick(ms) obs.advance(ms, function() end) end
     return { obs = obs, net = net, env = env, api = api, Sorter = Sorter, written = written, printed = printed, tick = tick }
@@ -247,6 +252,305 @@ test("steam: foreground hook queues only real untitled fullscreen games", functi
     check("a new fullscreen game from a library is looked up early", t.net.requests == 1, "requests=" .. t.net.requests)
 end)
 
+------------------------------------------------------------------
+-- Game memory: played -> desktop for a minute -> saved
+------------------------------------------------------------------
+local function load_recent_game()
+    local src = read("src/31_organizer_tracking.lua")
+    local s = src:find("local function get_recent_game", 1, true)
+    local e = select(2, src:find("\nend\n", s, true))
+    local obs = Mock.new()
+    local env = { obs = obs, fg_history = {} }
+    local fn = compile(src:sub(s, e) .. "\nreturn get_recent_game", "recent", env)()
+    obs.advance(3600000, function() end)
+    return fn, env, obs
+end
+
+test("memory: game 40 s, then 50 s on the desktop -> the game is found", function()
+    local fn, env, obs = load_recent_game()
+    local now = obs.os_gettime_ns()
+    env.fg_history[1] = { start_ns = now - 90e9, end_ns = now - 50e9, exe_name = "Game", window_title = "Game", is_fullscreen = true }
+    env.fg_history[2] = { start_ns = now - 50e9, end_ns = now, exe_name = "explorer", window_title = "Desktop", is_fullscreen = false }
+    local g = fn(60, function(e) return e.exe_name == "Game" end, 2)
+    check("game found after 50 s on the desktop", g ~= nil and g.exe_name == "Game", g and g.exe_name)
+end)
+
+test("memory: a game from long ago, outside the window, is NOT used", function()
+    local fn, env, obs = load_recent_game()
+    local now = obs.os_gettime_ns()
+    env.fg_history[1] = { start_ns = now - 200e9, end_ns = now - 100e9, exe_name = "Game", window_title = "Game", is_fullscreen = true }
+    env.fg_history[2] = { start_ns = now - 100e9, end_ns = now, exe_name = "explorer", window_title = "x", is_fullscreen = false }
+    check("game left more than a minute ago is ignored", fn(60, function(e) return e.exe_name == "Game" end, 2) == nil)
+end)
+
+test("memory: the LAST game wins, even if the earlier one was played longer", function()
+    local fn, env, obs = load_recent_game()
+    local now = obs.os_gettime_ns()
+    local is_game = function(e) return e.exe_name == "Flash" or e.exe_name == "A" or e.exe_name == "B" end
+    env.fg_history[1] = { start_ns = now - 58e9, end_ns = now - 20e9, exe_name = "A", window_title = "a", is_fullscreen = true }
+    env.fg_history[2] = { start_ns = now - 20e9, end_ns = now - 5e9, exe_name = "B", window_title = "b", is_fullscreen = true }
+    env.fg_history[3] = { start_ns = now - 5e9, end_ns = now, exe_name = "explorer", window_title = "x", is_fullscreen = false }
+    local g = fn(60, is_game, 2)
+    check("B (15 s, last) beats A (38 s, earlier)", g ~= nil and g.exe_name == "B", g and g.exe_name)
+    env.fg_history[3] = { start_ns = now - 5e9, end_ns = now - 4e9, exe_name = "Flash", window_title = "f", is_fullscreen = true }
+    env.fg_history[4] = { start_ns = now - 4e9, end_ns = now, exe_name = "explorer", window_title = "x", is_fullscreen = false }
+    g = fn(60, is_game, 2)
+    check("a 1 s flash of another game afterwards is ignored", g ~= nil and g.exe_name == "B", g and g.exe_name)
+    env.fg_history[3] = { start_ns = now - 5e9, end_ns = now - 1e9, exe_name = "A", window_title = "a", is_fullscreen = true }
+    g = fn(60, is_game, 2)
+    check("going back to A makes A the last game", g ~= nil and g.exe_name == "A", g and g.exe_name)
+end)
+
+------------------------------------------------------------------
+-- Is it a game? (classify_game)
+------------------------------------------------------------------
+local function load_classify()
+    local base = new_steam()
+    local g33 = read("src/33_organizer_files.lua")
+    local s = g33:find("local function classify_game", 1, true)
+    local e = select(2, g33:find("\nend\n", s, true))
+    local env = base.env
+    env.GENERIC_HOST_EXES = nil
+    local fn = compile(read("src/32_organizer_steam_names.lua") .. "\n" .. g33:sub(s, e) ..
+        "\nreturn classify_game", "classify", env)()
+    return fn, env
+end
+
+test("classify: what is and is not a game", function()
+    local classify, env = load_classify()
+    local function c(exe, path, fs, title) return classify({ exe_name = exe, exe_path = path, is_fullscreen = fs, window_title = title or "" }) end
+    check("Steam game, windowed", c("SomeGame", "D:\\SteamLibrary\\steamapps\\common\\Some\\SomeGame.exe", false) == true)
+    check("game on a custom drive, fullscreen", c("MyGame", "E:\\Stuff\\MyGame\\MyGame.exe", true) == true)
+    check("same game windowed, not in any library -> not guessed", c("MyGame", "E:\\Stuff\\MyGame\\MyGame.exe", false) == false)
+    check("browser fullscreen is not a game", c("chrome", "C:\\Program Files\\Google\\Chrome\\chrome.exe", true) == false)
+    check("Discord (AppData) fullscreen is not a game", c("SomeElectron", "C:\\Users\\u\\AppData\\Local\\Foo\\foo.exe", true) == false)
+    check("PowerPoint fullscreen is not a game", c("POWERPNT", "C:\\Program Files\\Microsoft Office\\root\\Office16\\POWERPNT.EXE", true) == false)
+    check("Steam client itself is not a game", c("steam", "C:\\Program Files (x86)\\Steam\\steam.exe", false) == false)
+    check("Epic launcher is not a game", c("EpicGamesLauncher", "C:\\Program Files\\Epic Games\\Launcher\\x.exe", true) == false)
+    check("known game by exe name, windowed", (function() env.KNOWN_GAMES["eldenring"] = "Elden Ring"; return c("eldenring", nil, false) end)() == true)
+    check("javaw without minecraft in the title is not a game", c("javaw", nil, true, "Some Java App") == false)
+    check("javaw with Minecraft in the title is a game", c("javaw", nil, false, "Minecraft 1.20") == true)
+    check("Minecraft modpack title (no 'Minecraft' word) under javaw is a game",
+        c("javaw", nil, false, "All the Mods 9 1.20.1 - Multiplayer (3rd-party Server)") == true)
+    check("same title under another exe name is a game too",
+        c("SomeJavaRuntime", "C:\\x\\y.exe", false, "Pack - Singleplayer") == true)
+    check("a browser tab titled like that is still not a game", c("chrome", nil, false, "Foo - Singleplayer") == false)
+    check("an ordinary title ending in 'singleplayer' text mid-sentence is not matched",
+        c("javaw", nil, false, "Singleplayer mode guide") == false)
+    check("protected fullscreen window is a game", classify({ exe_name = "?protected", protected = true, window_title = "X" }) == true)
+    check("your own Add entry wins over the non-game list", (function() env.name_map["chrome"] = "Cloud Game"; return c("chrome", nil, false) end)() == true)
+end)
+
+test("friendly_name: Minecraft under any launcher title", function()
+    local steam = new_steam()
+    local fn = steam.api.friendly_name
+    check("modpack title under javaw -> Minecraft", fn("javaw", "ATM9 1.20.1 - Multiplayer (3rd-party Server)", false, nil) == "Minecraft")
+    check("LAN title -> Minecraft", fn("javaw", "Multiplayer (LAN)", false, nil) == "Minecraft")
+    check("plain Minecraft title still -> Minecraft", fn("javaw", "Minecraft* 1.20.1 - Singleplayer", false, nil) == "Minecraft")
+end)
+
+
+------------------------------------------------------------------
+-- Official names (32b): launcher records, exe info, OBS Game Capture
+------------------------------------------------------------------
+local ACF = '"AppState"\n{\n\t"appid"\t\t"1145350"\n\t"name"\t\t"Hades II"\n\t"StateFlags"\t\t"4"\n\t"installdir"\t\t"Hades II"\n}\n'
+local function epic_item(name, loc, app, main)
+    return '{"FormatVersion":0,"DisplayName":"' .. name .. '","InstallLocation":"' .. loc:gsub("\\", "\\\\") ..
+        '","AppName":"' .. app .. '","MainGameAppName":"' .. (main or app) .. '"}'
+end
+
+local function new_official()
+    local t = new_steam({ official = true })
+    local on = t.env.C.on
+    t.files, t.dirs, t.exe_info = {}, {}, {}
+    on.list_dir = function(dir, mask) t.listed = (t.listed or 0) + 1 return t.dirs[dir:lower() .. "|" .. mask] or {} end
+    on.read_text = function(path) return t.files[path:lower()] end
+    on.exe_strings = function(path) local i = t.exe_info[path:lower()] if i then return i[1], i[2] end return nil end
+    t.on = on
+    return t
+end
+
+test("official: Steam appmanifest gives the exact name, from any library drive", function()
+    local t = new_official()
+    local lib = "D:\\SteamLibrary\\steamapps"
+    t.dirs[lib:lower() .. "|appmanifest_*.acf"] = { "appmanifest_1145350.acf" }
+    t.files[(lib .. "\\appmanifest_1145350.acf"):lower()] = ACF
+    local fn = t.api.friendly_name
+    check("Hades2.exe -> Hades II", fn("Hades2", "Hades II - 144 FPS", true, lib .. "\\common\\Hades II\\Ship\\Hades2.exe") == "Hades II")
+    check("name does not follow the window title", fn("Hades2", "something else", true, lib .. "\\common\\Hades II\\Ship\\Hades2.exe") == "Hades II")
+    local before = t.listed
+    fn("Hades2", "x", true, lib .. "\\common\\Hades II\\Ship\\Hades2.exe")
+    check("second call is served from the cache (no directory scan)", t.listed == before)
+end)
+
+test("official: your own names and known_games still win", function()
+    local t = new_official()
+    local lib = "D:\\SteamLibrary\\steamapps"
+    t.dirs[lib:lower() .. "|appmanifest_*.acf"] = { "a.acf" }
+    t.files[(lib .. "\\a.acf"):lower()] = ACF
+    local path = lib .. "\\common\\Hades II\\Hades2.exe"
+    t.env.name_map["hades2"] = "My Hades"
+    check("name_map wins", t.api.friendly_name("Hades2", "", true, path) == "My Hades")
+    t.env.name_map["hades2"] = nil
+    t.env.KNOWN_GAMES["hades2"] = "Known Hades"
+    check("known games wins", t.api.friendly_name("Hades2", "", true, path) == "Known Hades")
+end)
+
+test("official: a game installed after the first scan is found on the next try", function()
+    local t = new_official()
+    local lib = "D:\\SteamLibrary\\steamapps"
+    local path = lib .. "\\common\\Hades II\\Hades2.exe"
+    check("not installed yet -> falls back to the title", t.api.friendly_name("Hades2", "Hades Window", true, path) == "Hades Window")
+    t.dirs[lib:lower() .. "|appmanifest_*.acf"] = { "a.acf" }
+    t.files[(lib .. "\\a.acf"):lower()] = ACF
+    t.obs.advance(125000, function() end)  -- past the 2-minute 'not found' memory and the 1-minute rescan limit
+    check("after the waiting time the manifest is read", t.api.friendly_name("Hades2", "Hades Window", true, path) == "Hades II")
+end)
+
+test("official: Epic manifests (DLC and nested exe handled)", function()
+    local t = new_official()
+    local dir = "C:\\ProgramData\\Epic\\EpicGamesLauncher\\Data\\Manifests"
+    t.dirs[dir:lower() .. "|*.item"] = { "1.item", "2.item" }
+    t.files[(dir .. "\\1.item"):lower()] = epic_item("Fortnite\\u2122", "C:\\Games\\Fortnite", "Fortnite")
+    t.files[(dir .. "\\2.item"):lower()] = epic_item("Fortnite Skin Pack", "C:\\Games\\Fortnite", "FortniteDLC", "Fortnite")
+    local fn = t.api.friendly_name
+    check("exe inside InstallLocation -> main game name, TM removed",
+        fn("FortniteClient-Win64-Shipping", "", true, "C:\\Games\\Fortnite\\FortniteGame\\Binaries\\Win64\\FortniteClient-Win64-Shipping.exe") == "Fortnite")
+    check("a similarly named folder is NOT matched",
+        fn("x", "My Title", true, "C:\\Games\\Fortnite2\\x.exe") == "My Title")
+end)
+
+test("official: GOG info file (main game only)", function()
+    local t = new_official()
+    local root = "E:\\GOG Games\\Witcher 3"
+    t.dirs[(root .. "\\bin\\x64"):lower() .. "|goggame-*.info"] = {}
+    t.dirs[(root .. "\\bin"):lower() .. "|goggame-*.info"] = {}
+    t.dirs[root:lower() .. "|goggame-*.info"] = { "goggame-dlc.info", "goggame-1207664643.info" }
+    t.files[(root .. "\\goggame-dlc.info"):lower()] = '{"name":"DLC Pack","gameId":"2"}'
+    t.files[(root .. "\\goggame-1207664643.info"):lower()] = '{"gameId":"1","name":"The Witcher 3: Wild Hunt","playTasks":[{"name":"Play"}]}'
+    check("deep exe finds the root info", t.api.friendly_name("witcher3", "", true, root .. "\\bin\\x64\\witcher3.exe") == "The Witcher 3: Wild Hunt")
+end)
+
+test("official: exe ProductName / FileDescription, generic values ignored", function()
+    local t = new_official()
+    local on = t.on
+    check("Unreal Engine product -> next field", on.pick_version_name("Unreal Engine", "Palworld", "Palworld-Win64-Shipping") == "Palworld")
+    check("Game is generic", on.pick_version_name("Game", nil, "x") == nil)
+    check("Microsoft Windows OS string is ignored", on.pick_version_name("Microsoft\194\174 Windows\194\174 Operating System", nil, "x") == nil)
+    check("name equal to the exe stem adds nothing", on.pick_version_name("hades2", nil, "Hades2") == nil)
+    check("Win64-Shipping suffix removed", on.pick_version_name("Dead Island 2 Win64-Shipping", nil, "DeadIsland-Win64-Shipping") == "Dead Island 2")
+    check("symbols removed", on.pick_version_name("Tom Clancy\226\128\153s Game\194\174", nil, "x") == "Tom Clancy\226\128\153s Game")
+    t.exe_info["d:\\g\\cool.exe"] = { "Cool Platformer", "cool" }
+    check("friendly_name uses it when no launcher knows the game", t.api.friendly_name("cool", "Cool - 60 FPS", true, "D:\\G\\cool.exe") == "Cool Platformer")
+    check("generic hosts never use it (javaw)", t.api.friendly_name("javaw", "My Java Game", false, "C:\\Java\\javaw.exe") == "My Java Game")
+end)
+
+test("official: a failing lookup never breaks naming", function()
+    local t = new_official()
+    t.on.list_dir = function() error("boom") end
+    check("falls back to the window title", t.api.friendly_name("Hades2", "Hades II", true, "D:\\SteamLibrary\\steamapps\\common\\Hades II\\Hades2.exe") == "Hades II")
+    check("the failure was logged", #t.printed > 0)
+end)
+
+test("official: switch off restores the old behaviour", function()
+    local t = new_official()
+    local lib = "D:\\SteamLibrary\\steamapps"
+    t.dirs[lib:lower() .. "|appmanifest_*.acf"] = { "a.acf" }
+    t.files[(lib .. "\\a.acf"):lower()] = ACF
+    t.on.enabled = false
+    check("title used when disabled", t.api.friendly_name("Hades2", "Window Title", true, lib .. "\\common\\Hades II\\Hades2.exe") == "Window Title")
+end)
+
+test("official: OBS Game Capture hooked exe", function()
+    local t = new_official()
+    local obs = t.obs
+    local hooked = true
+    local fake_cd = { exe = "EldenRing.exe", title = "ELDEN RING\226\132\162" }
+    obs.obs_enum_sources = function() return { "src1", "src2" } end
+    obs.source_list_release = function() end
+    obs.obs_source_get_unversioned_id = function(s) return s == "src1" and "game_capture" or "window_capture" end
+    obs.obs_source_get_proc_handler = function() return {} end
+    obs.calldata_create = function() return {} end
+    obs.calldata_destroy = function() end
+    obs.proc_handler_call = function() return true end
+    obs.calldata_bool = function() return hooked end
+    obs.calldata_string = function(_, k) return k == "executable" and fake_cd.exe or fake_cd.title end
+    t.on.refresh_hooked()
+    check("exe remembered (lowercase, no .exe)", t.on.seen_hooked["eldenring"] == true)
+    check("title remembered (TM stripped)", t.on.hook_title["eldenring"] == "ELDEN RING")
+    check("only game_capture sources are asked", t.on.seen_hooked["window_capture"] == nil)
+    check("untitled window gets the hooked title", t.api.friendly_name("EldenRing", "", false, nil) == "ELDEN RING")
+    hooked = false
+    fake_cd.exe = "other.exe"
+    t.obs.advance(3500, function() end)
+    t.on.refresh_hooked()
+    check("a source that is not hooked adds nothing", t.on.seen_hooked["other"] == nil)
+end)
+
+test("classify: a game hooked by OBS Game Capture is a game, a launcher never", function()
+    local classify, env = load_classify()
+    env.C.on = { seen_hooked = { somegame = true, steam = true }, hook_title = {} }
+    local function c(exe, path, fs) return classify({ exe_name = exe, exe_path = path, is_fullscreen = fs, window_title = "" }) end
+    check("hooked exe in an odd folder, windowed", c("SomeGame", "E:\\Stuff\\SomeGame.exe", false) == true)
+    check("not hooked -> still not guessed", c("OtherGame", "E:\\Stuff\\OtherGame.exe", false) == false)
+    check("a hooked launcher is still excluded", c("steam", "C:\\Program Files (x86)\\Steam\\steam.exe", false) == false)
+end)
+
+
+test("minecraft mode titles are recognised for the protected (unreadable exe) path too", function()
+    local steam = new_steam()
+    local g33 = read("src/33_organizer_files.lua")
+    check("protected branch checks the Minecraft title", g33:find("is_minecraft_mode_title(info.window_title)", 1, true) ~= nil)
+end)
+
+test("friendly_name: a stale javaw mapping cannot override a Minecraft mode title", function()
+    local steam = new_steam()
+    steam.env.KNOWN_GAMES["javaw"] = "Multiplayer (3rd-party Server)"
+    steam.env.name_map["javaw"] = "Multiplayer (3rd-party Server)"
+    check("-> Minecraft", steam.api.friendly_name("javaw", "Guns and Ture 1.20.1 - Multiplayer (3rd-party Server)", false, nil) == "Minecraft")
+end)
+
+test("friendly_name: stale javaw mapping + plain Minecraft Forge title -> Minecraft", function()
+    local steam = new_steam()
+    steam.env.KNOWN_GAMES["javaw"] = "Multiplayer (3rd-party Server)"
+    check("-> Minecraft", steam.api.friendly_name("javaw", "Minecraft* Forge 1.20.1", false, nil) == "Minecraft")
+end)
+
+test("generic hosts (any javaw / UWP game): exe-keyed lists never decide, titles do", function()
+    local steam = new_steam()
+    local fn = steam.api.friendly_name
+    steam.env.KNOWN_GAMES["javaw"] = "Stale Name"
+    steam.env.name_map["javaw"] = "Stale Name"
+    check("stale javaw entries are ignored for a non-Minecraft Java game", fn("javaw", "Foo Game 1.2", false, nil) == "Foo Game 1.2")
+    check("same for a Store (UWP) host", (function() steam.env.KNOWN_GAMES["applicationframehost"] = "Stale"; return fn("ApplicationFrameHost", "Forza Horizon", true, nil) end)() == "Forza Horizon")
+    check("a normal exe still honours its entry", (function() steam.env.KNOWN_GAMES["eldenring"] = "Elden Ring"; return fn("eldenring", "x", true, nil) end)() == "Elden Ring")
+end)
+
+test("generic hosts: your own title rule (known_games.txt  title:<keyword>=<Name>)", function()
+    local steam = new_steam()
+    steam.env.KNOWN_GAMES["title:foo game"] = "Foo Game"
+    check("title containing the keyword -> the rule's name", steam.api.friendly_name("javaw", "Foo Game 1.2 - Level 3 (Server)", false, nil) == "Foo Game")
+    local classify, env = load_classify()
+    env.KNOWN_GAMES["title:foo game"] = "Foo Game"
+    env.KNOWN_GAMES["javaw"] = "Stale"
+    local function c(title) return classify({ exe_name = "javaw", exe_path = "C:\\Java\\javaw.exe", is_fullscreen = false, window_title = title }) end
+    check("javaw + matching title is a game", c("Foo Game 1.2") == true)
+    check("javaw alone (stale list entry) is NOT a game", c("Some IDE") == false)
+end)
+
+test("generic hosts: the part of the title that stays the same is the name", function()
+    local steam = new_steam()
+    steam.env.fg_history = {
+        { exe_name = "javaw", window_title = "Foo Game - Menu" },
+        { exe_name = "javaw", window_title = "Foo Game - Level 3 (Server)" },
+        { exe_name = "chrome", window_title = "Foo Game - Wiki" },
+    }
+    local fn = steam.api.friendly_name
+    check("segment shared by the titles wins over the changing state", fn("javaw", "Foo Game - Level 3 (Server)", false, nil) == "Foo Game")
+    steam.env.fg_history = {}
+    steam.env.extract_stable_app_name = function() return "OLD RULE" end
+    check("with a single title the old rule (extract_stable_app_name) applies", fn("javaw", "Foo Game - Level 3", false, nil) == "OLD RULE")
+end)
 ------------------------------------------------------------------
 print("")
 for _, line in ipairs(results) do print(line) end

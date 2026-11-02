@@ -268,7 +268,7 @@ local function resume_replay_buffer_after_relaunch(marker)
 end
 
 function script_load(settings)
-    print("OBS Clip Suite v" .. VERSION .. " loaded (games-only organizer)")
+    print("OBS Clip Suite v" .. VERSION .. " loaded (games-only organizer, build: official-names+minecraft-fix) from " .. tostring(script_path()))
     obs.obs_frontend_add_event_callback(on_frontend_event)
     guard("Sorter.script_load", Sorter.script_load)
 

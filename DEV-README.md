@@ -9,7 +9,7 @@ Edit the parts in `src\`, then build. The result is ONE file:
 | `10_restarter.lua` | Module 1: Replay Buffer Restarter |
 | `20_alert_sounds_data.lua` | base64 sounds (huge, no need to open) |
 | `21_alert_sound.lua` | Module 3: Clip Alert Sound |
-| `30_organizer_win32.lua` ... `33_organizer_files.lua` | Module 2: Replay Organizer (4 parts) |
+| `30_organizer_win32.lua` ... `33_organizer_files.lua` | Module 2: Replay Organizer (5 parts; `32b_organizer_official_names.lua` = launcher / exe / Game Capture names) |
 | `40_updater_core.lua` ... `42_updater_check.lua` | Module 4: Update Checker (3 parts) |
 | `90_main.lua` | OBS lifecycle hooks (`script_properties`, `script_load`, ...) |
 
