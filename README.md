@@ -1,10 +1,15 @@
 # OBS Clip Suite
 
-One OBS Studio Lua script that turns OBS **Replay Buffer** into an **NVIDIA ShadowPlay Instant Replay**-style experience on Windows. Press your save hotkey, and the clip behaves like a ShadowPlay clip:
+One OBS Studio Lua script that makes OBS **Replay Buffer** work like **NVIDIA ShadowPlay Instant Replay** on Windows, plus a few extras that ShadowPlay doesn't have.
 
-1. **Replay Buffer Restarter** – restarts the buffer right after every save, so back-to-back clips never share overlapping footage (like ShadowPlay).
-2. **Replay Organizer** – sorts each saved clip into a per-game folder automatically, named after the game, just like ShadowPlay does.
-3. **Clip Alert Sound** – plays a short sound every time a clip is saved, like ShadowPlay's save notification.
+**ShadowPlay-style features**
+
+1. **Replay Buffer Restarter** – restarts the buffer right after every save, so each clip is always a new video and back-to-back clips never share overlapping footage, just like ShadowPlay.
+2. **Replay Organizer** – sorts each saved clip into a per-game folder automatically, named after the game.
+
+**Extras**
+
+3. **Clip Alert Sound** – plays a short sound every time a clip is saved. ShadowPlay shows an on-screen overlay when a clip is saved; this sound is the replacement for it, since OBS has no such overlay.
 4. **Update Checker** – checks this repo's Releases and updates the script for you.
 
 Everything lives in a single file: `obs_to_nvidia.lua`.
