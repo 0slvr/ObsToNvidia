@@ -153,6 +153,8 @@ local function classify_game(info)
     if C.on and C.on.seen_hooked[exe_lower] then return true end
     -- A Minecraft window (see is_minecraft_mode_title), under any launcher / java exe.
     if is_minecraft_mode_title(info.window_title) then return true end
+    -- A window title that matches one of YOUR title: rules (known_games.txt / Add list).
+    if C.user_title_rule(info.window_title) then return true end
     if GENERIC_HOST_EXES[exe_lower] then
         -- javaw / ApplicationFrameHost: only a game if the title says so
         -- (e.g. Minecraft); the exe alone can't tell.
@@ -195,8 +197,9 @@ end
     -- Buffer is shorter) decides: you played, maybe switched to another game, maybe
     -- went to the desktop / Discord / a browser, and then pressed save -- the clip is
     -- from the game you were playing last. Only a game that stayed in front for at
-    -- least 2 seconds counts, so a window flashing past is ignored.
-    local info = get_recent_game(game_memory_seconds(), classify_game, 2)
+    -- least 5 seconds counts, so a window flashing past (or a helper tool you glance at
+    -- while playing) is ignored.
+    local info = get_recent_game(game_memory_seconds(), classify_game, 5)
     local is_game = info ~= nil
     local from_memory = false
     if is_game then
@@ -220,8 +223,11 @@ end
         if info.protected then
             -- Exe unreadable (anti-cheat/protected) but the window is fullscreen
             -- and titled: named from the title.
+            local by_title = C.user_title_rule(info.window_title)
             if is_minecraft_mode_title(info.window_title) then
                 game = "Minecraft" -- same rule as friendly_name: the mode suffix is not a game name
+            elseif by_title then
+                game = by_title
             else
                 game = extract_stable_app_name(info.window_title, true)
             end

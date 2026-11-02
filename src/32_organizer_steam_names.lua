@@ -48,17 +48,13 @@ local function is_minecraft_mode_title(title)
     return t:find("%- singleplayer%s*$") ~= nil or t:find("%- multiplayer %b()%s*$") ~= nil
 end
 
--- A name decided by the WINDOW TITLE, for programs whose exe says nothing (generic hosts)
--- and for Minecraft-style mode titles. Sources: Minecraft's mode titles, the built-in
--- TITLE_KEYWORD_NAMES, and your own rules: a line  title:<keyword>=<Folder Name>  in
--- known_games.txt (or the Add list). Example:  title:hollow knight=Hollow Knight
-local function title_rule_name(title)
+-- YOUR title rules: a line  title:<keyword>=<Folder Name>  in known_games.txt (or the Add
+-- list). Works for ANY program: a window whose title contains the keyword is that game.
+-- Example:  title:hollow knight=Hollow Knight
+-- (A table field, not a chunk-level local: the combined script is near LuaJIT's local limit.)
+function C.user_title_rule(title)
     if title == nil or title == "" then return nil end
-    if is_minecraft_mode_title(title) then return "Minecraft" end
     local lowered = title:lower()
-    for _, rule in ipairs(TITLE_KEYWORD_NAMES) do
-        if lowered:find(rule[1], 1, true) then return rule[2] end
-    end
     for _, map in ipairs({ name_map, KNOWN_GAMES }) do
         for key, name in pairs(map) do
             if key:sub(1, 6) == "title:" and #key > 6 and lowered:find(key:sub(7), 1, true) then
@@ -67,6 +63,19 @@ local function title_rule_name(title)
         end
     end
     return nil
+end
+
+-- A name decided by the WINDOW TITLE, for programs whose exe says nothing (generic hosts)
+-- and for Minecraft-style mode titles. Sources: Minecraft's mode titles, the built-in
+-- TITLE_KEYWORD_NAMES, and your own title: rules (see C.user_title_rule).
+local function title_rule_name(title)
+    if title == nil or title == "" then return nil end
+    if is_minecraft_mode_title(title) then return "Minecraft" end
+    local lowered = title:lower()
+    for _, rule in ipairs(TITLE_KEYWORD_NAMES) do
+        if lowered:find(rule[1], 1, true) then return rule[2] end
+    end
+    return C.user_title_rule(title)
 end
 
 -- "Game 1.2 - Level 3" / "Game 1.2 - Multiplayer (Server)": the state part changes, the
@@ -613,6 +622,13 @@ local NON_GAME_EXES = {
     kodi = true, stremio = true, plex = true, slack = true, telegram = true,
     ["mpc-be64"] = true, ["mpc-hc"] = true, smplayer = true, kmplayer = true,
     wallpaper32 = true, wallpaper64 = true,
+    -- Helper / overlay / launcher tools that are often installed in a game library or kept
+    -- open next to a game (a few seconds in front of one must not take over its clip).
+    losslessscaling = true, soundpad = true,
+    voicemeeter = true, voicemeeterpro = true, voicemeeter8x64 = true,
+    msiafterburner = true, rtss = true, hwinfo64 = true, hwinfo32 = true,
+    ["playnite.desktopapp"] = true, ["playnite.fullscreenapp"] = true,
+    borderlessgaming = true, vrmonitor = true, vrdashboard = true,
 }
 
 -- Install locations of the common game stores / launchers. In strict mode an
@@ -697,6 +713,12 @@ local function friendly_name(raw_exe_name, window_title, is_fullscreen, exe_path
     local known = KNOWN_GAMES[lower]
     if known then
         return known
+    end
+
+    -- Your own title: rule (known_games.txt / Add list) for any program.
+    local by_title = C.user_title_rule(window_title)
+    if by_title then
+        return by_title
     end
 
     -- Any program whose window title is a Minecraft mode title is Minecraft, whatever

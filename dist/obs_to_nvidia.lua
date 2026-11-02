@@ -7,11 +7,7 @@ GitHub Releases. Each module has its own group and on/off checkbox.
 --]]
 
 -- Bump on every GitHub Release (compared numerically: 1.10.0 > 1.9.0).
-<<<<<<< HEAD
 local VERSION = "2.27"
-=======
-local VERSION = "2.27"
->>>>>>> fd041e9 (Release v2.20)
 
 obs = obslua
 
@@ -2358,7 +2354,6 @@ end
 -- Puts the primed source on the output channel = plays it from the start,
 -- and (re)starts the poll that watches it.
 local function attach_alert()
-<<<<<<< HEAD
     -- A sound still on the channel from a previous save (rapid saves):
     -- do NOT detach + re-attach in the same tick. OBS handles the deactivate
     -- asynchronously, so "restart on activate" often never fires and the new
@@ -2372,11 +2367,6 @@ local function attach_alert()
         obs.timer_add(poll_alert, ALERT_POLL_MS)
         return
     end
-=======
-    -- A sound still playing from a previous save: take it off first so the
-    -- activation (and with it "restart on activate") happens again.
-    detach_alert()
->>>>>>> fd041e9 (Release v2.20)
     obs.obs_set_output_source(SOUND_CHANNEL, alert_source)
     alert_attached = true
     alert_started_ns = obs.os_gettime_ns()
@@ -2396,13 +2386,10 @@ local function finish_alert()
 end
 
 poll_alert = function()
-<<<<<<< HEAD
     -- Runs from a 30 ms timer: an error here must never repeat 30x a second
     -- or leave the sound source stuck on the output channel.
     local ok, err = pcall(function()
 
-=======
->>>>>>> fd041e9 (Release v2.20)
     if alert_source == nil or not alert_attached then
         obs.timer_remove(poll_alert)
         return
@@ -2419,7 +2406,6 @@ poll_alert = function()
             or state == obs.OBS_MEDIA_STATE_STOPPED then
             return finish_alert()
         end
-<<<<<<< HEAD
     elseif state == obs.OBS_MEDIA_STATE_ENDED
         and not alert_nudged
         and (obs.obs_source_media_get_duration(alert_source) or 0) > 0
@@ -2429,8 +2415,6 @@ poll_alert = function()
         -- Without this, the code below mistook it for "never started" and
         -- rebuilt + replayed it = the alert sounded twice.
         return finish_alert()
-=======
->>>>>>> fd041e9 (Release v2.20)
     elseif state == obs.OBS_MEDIA_STATE_ERROR or elapsed_ms >= ALERT_REBUILD_MS then
         -- Never became audible: start over with a fresh source.
         alert_rebuilds = alert_rebuilds + 1
@@ -2452,15 +2436,12 @@ poll_alert = function()
     if elapsed_ms >= sound_channel_hold_ms then
         finish_alert()
     end
-<<<<<<< HEAD
     end)
     if not ok then
         obs.script_log(obs.LOG_ERROR, "Clip Alert: playback check failed: " .. tostring(err))
         obs.timer_remove(poll_alert)
         pcall(detach_alert)
     end
-=======
->>>>>>> fd041e9 (Release v2.20)
 end
 
 local last_alert_ns = 0
@@ -2516,10 +2497,7 @@ end
 
 local function confirm_and_play()
     obs.timer_remove(confirm_and_play)
-<<<<<<< HEAD
     local ok, err = pcall(function()
-=======
->>>>>>> fd041e9 (Release v2.20)
     local status, path = last_saved_status()
     if status == "missing" then
         -- Not on disk (yet): look again a few times before giving up.
@@ -2533,13 +2511,10 @@ local function confirm_and_play()
         return
     end
     do_sound_alert(false)
-<<<<<<< HEAD
     end)
     if not ok then
         obs.script_log(obs.LOG_ERROR, "Clip Alert: alert failed: " .. tostring(err))
     end
-=======
->>>>>>> fd041e9 (Release v2.20)
 end
 
     local function trigger_alerts()
@@ -3411,8 +3386,9 @@ local steam_lookup_enabled = true
 local pending_move_timers = {}
 
 local FG_POLL_MS       = 500        -- how often we sample the foreground window
--- Long enough to cover the whole Replay Buffer (up to 30 min) so that a clip saved from
--- the desktop can still be traced back to the game that is in it (see get_recent_game).
+-- Kept for 30 minutes. NOTE: choosing the game of a clip only looks back game_memory_seconds()
+-- (at most one minute, see get_recent_game); the longer history is used to name generic hosts
+-- (javaw, ApplicationFrameHost...) from the titles they had, and to teach a game by its exe name.
 local FG_HISTORY_MAX_S = 1800       -- drop samples older than this (keeps the table small)
 local fg_history = {}               -- { {start_ns, end_ns, exe_name, window_title, is_fullscreen}, ... }
 
@@ -4237,17 +4213,13 @@ local function is_minecraft_mode_title(title)
     return t:find("%- singleplayer%s*$") ~= nil or t:find("%- multiplayer %b()%s*$") ~= nil
 end
 
--- A name decided by the WINDOW TITLE, for programs whose exe says nothing (generic hosts)
--- and for Minecraft-style mode titles. Sources: Minecraft's mode titles, the built-in
--- TITLE_KEYWORD_NAMES, and your own rules: a line  title:<keyword>=<Folder Name>  in
--- known_games.txt (or the Add list). Example:  title:hollow knight=Hollow Knight
-local function title_rule_name(title)
+-- YOUR title rules: a line  title:<keyword>=<Folder Name>  in known_games.txt (or the Add
+-- list). Works for ANY program: a window whose title contains the keyword is that game.
+-- Example:  title:hollow knight=Hollow Knight
+-- (A table field, not a chunk-level local: the combined script is near LuaJIT's local limit.)
+function C.user_title_rule(title)
     if title == nil or title == "" then return nil end
-    if is_minecraft_mode_title(title) then return "Minecraft" end
     local lowered = title:lower()
-    for _, rule in ipairs(TITLE_KEYWORD_NAMES) do
-        if lowered:find(rule[1], 1, true) then return rule[2] end
-    end
     for _, map in ipairs({ name_map, KNOWN_GAMES }) do
         for key, name in pairs(map) do
             if key:sub(1, 6) == "title:" and #key > 6 and lowered:find(key:sub(7), 1, true) then
@@ -4256,6 +4228,19 @@ local function title_rule_name(title)
         end
     end
     return nil
+end
+
+-- A name decided by the WINDOW TITLE, for programs whose exe says nothing (generic hosts)
+-- and for Minecraft-style mode titles. Sources: Minecraft's mode titles, the built-in
+-- TITLE_KEYWORD_NAMES, and your own title: rules (see C.user_title_rule).
+local function title_rule_name(title)
+    if title == nil or title == "" then return nil end
+    if is_minecraft_mode_title(title) then return "Minecraft" end
+    local lowered = title:lower()
+    for _, rule in ipairs(TITLE_KEYWORD_NAMES) do
+        if lowered:find(rule[1], 1, true) then return rule[2] end
+    end
+    return C.user_title_rule(title)
 end
 
 -- "Game 1.2 - Level 3" / "Game 1.2 - Multiplayer (Server)": the state part changes, the
@@ -4802,6 +4787,13 @@ local NON_GAME_EXES = {
     kodi = true, stremio = true, plex = true, slack = true, telegram = true,
     ["mpc-be64"] = true, ["mpc-hc"] = true, smplayer = true, kmplayer = true,
     wallpaper32 = true, wallpaper64 = true,
+    -- Helper / overlay / launcher tools that are often installed in a game library or kept
+    -- open next to a game (a few seconds in front of one must not take over its clip).
+    losslessscaling = true, soundpad = true,
+    voicemeeter = true, voicemeeterpro = true, voicemeeter8x64 = true,
+    msiafterburner = true, rtss = true, hwinfo64 = true, hwinfo32 = true,
+    ["playnite.desktopapp"] = true, ["playnite.fullscreenapp"] = true,
+    borderlessgaming = true, vrmonitor = true, vrdashboard = true,
 }
 
 -- Install locations of the common game stores / launchers. In strict mode an
@@ -4886,6 +4878,12 @@ local function friendly_name(raw_exe_name, window_title, is_fullscreen, exe_path
     local known = KNOWN_GAMES[lower]
     if known then
         return known
+    end
+
+    -- Your own title: rule (known_games.txt / Add list) for any program.
+    local by_title = C.user_title_rule(window_title)
+    if by_title then
+        return by_title
     end
 
     -- Any program whose window title is a Minecraft mode title is Minecraft, whatever
@@ -5014,7 +5012,17 @@ do
         ["shipping"] = true, ["electron"] = true, ["chromium"] = true, ["godot engine"] = true,
         ["openjdk platform binary"] = true, ["java(tm) platform se binary"] = true,
         ["microsoft windows operating system"] = true,
+        -- Engine / store / anti-cheat / tool strings and company names: not a game's name.
+        ["unreal engine 4"] = true, ["unreal engine 5"] = true, ["unity technologies"] = true,
+        ["epic games"] = true, ["epic online services"] = true, ["valve"] = true,
+        ["valve corporation"] = true, ["steam"] = true, ["easy anti-cheat"] = true,
+        ["easyanticheat"] = true, ["battleye"] = true, ["crash handler"] = true,
+        ["crash reporter"] = true, ["setup"] = true, ["installer"] = true, ["updater"] = true,
     }
+    -- A product / description that ends like a company name ("Foo Studios Inc.") names the
+    -- publisher, not the game.
+    -- (a table field, not a local: this block is close to the 200-locals limit)
+    ON.company_endings = { "inc", "llc", "ltd", "gmbh", "corp", "corporation", "co" }
 
     ----------------------------------------------------------------
     -- Pure text helpers (no Win32): these are what the tests exercise
@@ -5098,7 +5106,12 @@ do
             if n then
                 local lower = n:lower()
                 local norm = normalize_for_match(n)
+                local company = false
+                for _, w in ipairs(ON.company_endings) do
+                    if lower:find("%f[%w]" .. w .. "%.?$") then company = true end
+                end
                 if not GENERIC_PRODUCT[lower] and not lower:find("^microsoft")
+                   and not lower:find("unreal engine", 1, true) and not company
                    and not lower:find("%.exe$") and #norm >= 3 and norm ~= stem then
                     return n
                 end
@@ -5313,7 +5326,10 @@ BOOL  VerQueryValueW(const void* pBlock, const WCHAR* lpSubBlock, void** lplpBuf
                     local cd = obs.calldata_create()
                     if obs.proc_handler_call(ph, "get_hooked", cd) and obs.calldata_bool(cd, "hooked") then
                         local exe = (obs.calldata_string(cd, "executable") or ""):gsub("%.[Ee][Xx][Ee]$", ""):lower()
-                        if exe ~= "" then
+                        -- javaw / ApplicationFrameHost... run many programs: hooking one of them
+                        -- must not turn every window of that exe into a "game" for the session.
+                        local generic = GENERIC_HOST_EXES and GENERIC_HOST_EXES[exe]
+                        if exe ~= "" and not generic then
                             ON.seen_hooked[exe] = true
                             local title = ON.clean(obs.calldata_string(cd, "title"))
                             if title then ON.hook_title[exe] = title end
@@ -5481,6 +5497,8 @@ local function classify_game(info)
     if C.on and C.on.seen_hooked[exe_lower] then return true end
     -- A Minecraft window (see is_minecraft_mode_title), under any launcher / java exe.
     if is_minecraft_mode_title(info.window_title) then return true end
+    -- A window title that matches one of YOUR title: rules (known_games.txt / Add list).
+    if C.user_title_rule(info.window_title) then return true end
     if GENERIC_HOST_EXES[exe_lower] then
         -- javaw / ApplicationFrameHost: only a game if the title says so
         -- (e.g. Minecraft); the exe alone can't tell.
@@ -5523,8 +5541,9 @@ end
     -- Buffer is shorter) decides: you played, maybe switched to another game, maybe
     -- went to the desktop / Discord / a browser, and then pressed save -- the clip is
     -- from the game you were playing last. Only a game that stayed in front for at
-    -- least 2 seconds counts, so a window flashing past is ignored.
-    local info = get_recent_game(game_memory_seconds(), classify_game, 2)
+    -- least 5 seconds counts, so a window flashing past (or a helper tool you glance at
+    -- while playing) is ignored.
+    local info = get_recent_game(game_memory_seconds(), classify_game, 5)
     local is_game = info ~= nil
     local from_memory = false
     if is_game then
@@ -5548,8 +5567,11 @@ end
         if info.protected then
             -- Exe unreadable (anti-cheat/protected) but the window is fullscreen
             -- and titled: named from the title.
+            local by_title = C.user_title_rule(info.window_title)
             if is_minecraft_mode_title(info.window_title) then
                 game = "Minecraft" -- same rule as friendly_name: the mode suffix is not a game name
+            elseif by_title then
+                game = by_title
             else
                 game = extract_stable_app_name(info.window_title, true)
             end
@@ -7059,10 +7081,7 @@ local function on_frontend_event(event)
         -- Order matters: play the sound FIRST (it checks the clip is on disk at its
         -- original path, and must not wait for the Organizer, whose first-time Steam
         -- lookup can take seconds), then move the clip, then restart the buffer.
-<<<<<<< HEAD
         guard("Toast.on_replay_saved", Toast.on_replay_saved)
-=======
->>>>>>> fd041e9 (Release v2.20)
         guard("Alert.on_replay_saved", Alert.on_replay_saved)
         guard("Sorter.on_replay_saved", Sorter.on_replay_saved)
         guard("Restarter.on_replay_saved", Restarter.on_replay_saved)

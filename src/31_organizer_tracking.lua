@@ -41,8 +41,9 @@ local steam_lookup_enabled = true
 local pending_move_timers = {}
 
 local FG_POLL_MS       = 500        -- how often we sample the foreground window
--- Long enough to cover the whole Replay Buffer (up to 30 min) so that a clip saved from
--- the desktop can still be traced back to the game that is in it (see get_recent_game).
+-- Kept for 30 minutes. NOTE: choosing the game of a clip only looks back game_memory_seconds()
+-- (at most one minute, see get_recent_game); the longer history is used to name generic hosts
+-- (javaw, ApplicationFrameHost...) from the titles they had, and to teach a game by its exe name.
 local FG_HISTORY_MAX_S = 1800       -- drop samples older than this (keeps the table small)
 local fg_history = {}               -- { {start_ns, end_ns, exe_name, window_title, is_fullscreen}, ... }
 

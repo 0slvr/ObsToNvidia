@@ -43,7 +43,17 @@ do
         ["shipping"] = true, ["electron"] = true, ["chromium"] = true, ["godot engine"] = true,
         ["openjdk platform binary"] = true, ["java(tm) platform se binary"] = true,
         ["microsoft windows operating system"] = true,
+        -- Engine / store / anti-cheat / tool strings and company names: not a game's name.
+        ["unreal engine 4"] = true, ["unreal engine 5"] = true, ["unity technologies"] = true,
+        ["epic games"] = true, ["epic online services"] = true, ["valve"] = true,
+        ["valve corporation"] = true, ["steam"] = true, ["easy anti-cheat"] = true,
+        ["easyanticheat"] = true, ["battleye"] = true, ["crash handler"] = true,
+        ["crash reporter"] = true, ["setup"] = true, ["installer"] = true, ["updater"] = true,
     }
+    -- A product / description that ends like a company name ("Foo Studios Inc.") names the
+    -- publisher, not the game.
+    -- (a table field, not a local: this block is close to the 200-locals limit)
+    ON.company_endings = { "inc", "llc", "ltd", "gmbh", "corp", "corporation", "co" }
 
     ----------------------------------------------------------------
     -- Pure text helpers (no Win32): these are what the tests exercise
@@ -127,7 +137,12 @@ do
             if n then
                 local lower = n:lower()
                 local norm = normalize_for_match(n)
+                local company = false
+                for _, w in ipairs(ON.company_endings) do
+                    if lower:find("%f[%w]" .. w .. "%.?$") then company = true end
+                end
                 if not GENERIC_PRODUCT[lower] and not lower:find("^microsoft")
+                   and not lower:find("unreal engine", 1, true) and not company
                    and not lower:find("%.exe$") and #norm >= 3 and norm ~= stem then
                     return n
                 end
@@ -342,7 +357,10 @@ BOOL  VerQueryValueW(const void* pBlock, const WCHAR* lpSubBlock, void** lplpBuf
                     local cd = obs.calldata_create()
                     if obs.proc_handler_call(ph, "get_hooked", cd) and obs.calldata_bool(cd, "hooked") then
                         local exe = (obs.calldata_string(cd, "executable") or ""):gsub("%.[Ee][Xx][Ee]$", ""):lower()
-                        if exe ~= "" then
+                        -- javaw / ApplicationFrameHost... run many programs: hooking one of them
+                        -- must not turn every window of that exe into a "game" for the session.
+                        local generic = GENERIC_HOST_EXES and GENERIC_HOST_EXES[exe]
+                        if exe ~= "" and not generic then
                             ON.seen_hooked[exe] = true
                             local title = ON.clean(obs.calldata_string(cd, "title"))
                             if title then ON.hook_title[exe] = title end

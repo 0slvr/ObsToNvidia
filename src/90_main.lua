@@ -123,10 +123,7 @@ local function on_frontend_event(event)
         -- Order matters: play the sound FIRST (it checks the clip is on disk at its
         -- original path, and must not wait for the Organizer, whose first-time Steam
         -- lookup can take seconds), then move the clip, then restart the buffer.
-<<<<<<< HEAD
         guard("Toast.on_replay_saved", Toast.on_replay_saved)
-=======
->>>>>>> fd041e9 (Release v2.20)
         guard("Alert.on_replay_saved", Alert.on_replay_saved)
         guard("Sorter.on_replay_saved", Sorter.on_replay_saved)
         guard("Restarter.on_replay_saved", Restarter.on_replay_saved)
