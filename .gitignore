@@ -5,3 +5,13 @@ obj/
 publish.log
 *.zip
 .publish-state
+
+# local notes / assistant instructions (kept on disk, not published)
+CONTEXT.md
+DEV-README.md
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+.github/copilot-instructions.md
+dist/
+CHANGELOG.md
