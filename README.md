@@ -1,10 +1,10 @@
 # OBS Clip Suite
 
-One OBS Studio Lua script that makes **Replay Buffer clipping** painless on Windows:
+One OBS Studio Lua script that turns OBS **Replay Buffer** into an **NVIDIA ShadowPlay Instant Replay**-style experience on Windows. Press your save hotkey, and the clip behaves like a ShadowPlay clip:
 
-1. **Replay Buffer Restarter** – restarts the buffer right after every save, so back-to-back clips never share overlapping footage.
-2. **Replay Organizer** – sorts each saved clip into a per-game / per-app folder automatically.
-3. **Clip Alert Sound** – plays a short sound every time a clip is saved.
+1. **Replay Buffer Restarter** – restarts the buffer right after every save, so back-to-back clips never share overlapping footage (like ShadowPlay).
+2. **Replay Organizer** – sorts each saved clip into a per-game folder automatically, named after the game, just like ShadowPlay does.
+3. **Clip Alert Sound** – plays a short sound every time a clip is saved, like ShadowPlay's save notification.
 4. **Update Checker** – checks this repo's Releases and updates the script for you.
 
 Everything lives in a single file: `obs_to_nvidia.lua`.
@@ -48,13 +48,15 @@ After a save, the script asks OBS to stop the buffer, waits for OBS's "stopped" 
 Sorts every saved clip into a subfolder named after the game or app you were actually playing.
 
 - Detects the **real foreground window** using direct Win32 calls only (no `cmd.exe` / PowerShell is spawned), so **fullscreen games are never minimized or kicked to the desktop**.
-- Keeps a short rolling history of the foreground app, so a save that fires a couple of seconds after you alt-tab still goes to the right game.
+- **The last game you played wins.** The script remembers what was in front during the past minute (or less, if your Replay Buffer is shorter). If you play, then switch to the desktop, Discord or a browser and press save, the clip still goes to that game. A game has to stay in front for at least 2 seconds to count, so a window flashing past is ignored. If you played two games, the later one is used.
+- Games are detected **windowed or fullscreen** when they are installed in a game library (Steam, Epic, GOG, Riot...). A fullscreen game installed anywhere else (any drive or folder) is detected too. Windows, Office, browsers, launchers (Steam, Epic, Battle.net...) and per-user apps like Discord are never taken for games.
 - Non-game apps go into a shared **Desktop** folder.
 - Never overwrites an existing clip if two clips get the same name in the same second.
 - Handles non-ASCII (e.g. Arabic) folder names and paths.
-- **Custom names:** in the group, type the current folder name, type the new name, press **Add**. Your entries are saved with the script's settings.
-- **Known games list:** a built-in list is merged with your own entries in `known_games.txt` (in `%APPDATA%\obs-studio\script-data\OBS-Clip-Suite`). Reload the script after editing it.
-- **Game names:** your own names > built-in/known_games.txt > **official name** (Steam `appmanifest`, Epic manifest, GOG info file, then the exe's ProductName / FileDescription; all offline) > the game's window title > the Steam install folder name > Steam lookup. A game that an OBS **Game Capture** source has hooked is always treated as a game. Turn the official names off with *Use official game names*.
+- **Minecraft:** any launcher or modpack is recognised from the end of its window title (`- Singleplayer` / `- Multiplayer (...)`) and goes into a `Minecraft` folder.
+- **Custom names:** in the group, type the current folder name, type the new name, press **Add**. Your entries are saved with the script's settings. If the game has no folder yet, you can type its exe name as shown in Task Manager (e.g. `MyGame` or `MyGame.exe`), as long as it was in front recently.
+- **Known games list:** a built-in list is merged with your own entries in `known_games.txt` (in `%APPDATA%\obs-studio\script-data\OBS-Clip-Suite`). Reload the script after editing it. To name a game by its window title, add a line like `title:hollow knight=Hollow Knight`.
+- **Game names:** your own names > built-in/known_games.txt > **official name** (Steam `appmanifest`, Epic manifest, GOG info file, then the exe's ProductName / FileDescription; all offline) > the game's window title > the Steam install folder name > Steam lookup. Programs like `javaw` or Store apps (which can be any program) are named from their window title only. A game that an OBS **Game Capture** source has hooked is always treated as a game. Turn the official names off with *Use official game names*.
 - **Steam lookup (optional):** only when a game has no window title and no Steam folder, unknown games can be looked up on the Steam Store by name. Results are remembered in `known_games.txt`. Turn it off with *Look up unknown games on Steam*.
 
 ### 3) Clip Alert Sound
